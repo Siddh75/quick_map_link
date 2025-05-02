@@ -1,0 +1,9 @@
+[general]
+name=QuickMapLink
+qgisMinimumVersion=3.0
+description=Opens web maps (Google Maps, Bing Maps, or Apple Maps) in a separate window directly from within QGIS. Provides a context menu option to open the map at a specific location and a settings option to choose the preferred map provider.
+version=1.2
+author=Siddharth
+email=siddharthgupta7may@gmail.com
+category=Web
+about=This Plugin allows you to quickly view locations in web maps directly from QGIS. You can open Google Maps, Bing Maps, or Apple Maps at a specific point on your QGIS map canvas.

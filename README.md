@@ -37,7 +37,7 @@ Opens web maps (Google Maps, Bing Maps, or Apple Maps) in a separate window or b
 -->
 ### Manual Installation
 
-1.  Download the latest plugin release `.zip` file from the Releases page (Replace with your actual GitHub repo link).
+1.  Download the latest plugin release `.zip` file from the Releases page ([Replace with your actual GitHub repo link](https://github.com/Siddh75/quick_map_link/releases/tag/v1.2)).
 2.  Open QGIS.
 3.  Go to `Plugins` -> `Manage and Install Plugins...`.
 4.  Switch to the `Install from ZIP` tab.

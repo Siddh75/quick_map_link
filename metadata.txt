@@ -2,7 +2,7 @@
 name=QuickMapLink
 qgisMinimumVersion=3.16
 description=Right-click the map canvas to instantly open that location in Google Maps, Bing Maps, Apple Maps, OpenStreetMap, OpenTopoMap, or Wikimedia Maps.
-version=2.0.0
+version=2.1.0
 author=Siddharth
 email=siddharthgupta7may@gmail.com
 category=Web
@@ -14,3 +14,15 @@ icon=icon.png
 tags=maps,google maps,bing maps,apple maps,openstreetmap,openstreetmap maps,web,context menu,webview,coordinates,location
 experimental=False
 deprecated=False
+changelog=2.1.0
+        - Webview dock now remembers where it was left (docked side, or floating, and its exact size/position) and reopens the same way next time, including across QGIS restarts.
+    2.0.0
+        - Added OpenStreetMap, OpenTopoMap, and Wikimedia Maps as new providers.
+        - Added a single "Open in <Provider>" entry directly in QGIS's native right-click context menu.
+        - Webview is now a dockable panel that can be pinned to any edge of the QGIS window or left floating.
+        - Webview live-follows the QGIS canvas as you pan and zoom; browser mode can optionally live-follow too.
+        - Switched to QWebEngineView (Chromium) as the primary embedded renderer, with automatic fallback to QWebView (QtWebKit) on older QGIS builds.
+        - Bing Maps and Apple Maps are routed to Browser mode only; OpenStreetMap falls back to Browser mode on the legacy QtWebKit renderer.
+        - Added per-provider basemap/overlay style options.
+        - Corrected Apple Maps zoom level to better match the QGIS canvas.
+        - Simplified settings into a single dialog opened directly from Plugins > QuickMapLink.

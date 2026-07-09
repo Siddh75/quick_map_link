@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.idea/
+*.iml
+.DS_Store
+instructions.md

@@ -1,43 +1,33 @@
 # QuickMapLink QGIS Plugin
 
-[![License: GPL v2+](https://img.shields.io/badge/License-GPL%20v2+-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html) <!-- Choose your license -->
-![QGIS Version](https://img.shields.io/badge/QGIS-%3E%3D%203.0-brightgreen.svg)
+[![License: GPL v2+](https://img.shields.io/badge/License-GPL%20v2+-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
+![QGIS Version](https://img.shields.io/badge/QGIS-%3E%3D%203.16-brightgreen.svg)
 
-Opens web maps (Google Maps, Bing Maps, or Apple Maps) in a separate window or browser tab directly from within QGIS. Provides a context menu option to open the map at a specific location and a settings option to choose the preferred map provider.
-
-<!-- 
-**RECOMMENDED:** Add a screenshot or GIF here showing the context menu in action and maybe the resulting web map view.
-![QuickMapLink Screenshot](link_to_your_screenshot.png) 
--->
+Right-click the QGIS map canvas to instantly open that location in Google Maps, Bing Maps, Apple Maps, OpenStreetMap, OpenTopoMap, or Wikimedia Maps — either in an embedded, dockable webview or your system browser.
 
 ## Features
 
-*   **Context Menu Integration:** Adds options directly to the map canvas right-click menu.
-*   **Multiple Viewing Options:**
-    *   Open the selected location in an **embedded web view** within QGIS (`QWebView`).
-    *   Open the selected location in your system's **default web browser**.
-*   **Multiple Map Providers:** Supports viewing locations in:
-    *   Google Maps
-    *   Bing Maps
-    *   Apple Maps (Beta)
-*   **Configurable:** Choose your preferred default map provider via a simple settings dialog.
-*   **Toolbar Toggle:** Includes a toolbar button to quickly show or hide the plugin's context menu options if they clutter your workflow.
-*   **Coordinate Transformation:** Automatically transforms coordinates from your project's CRS to WGS 84 (EPSG:4326) for compatibility with web maps.
+*   **Native context menu integration:** Adds a single "Open in `<Provider>`" entry directly to QGIS's right-click context menu on the map canvas — no extra clicks to get past.
+*   **Six map providers:** Google Maps, Bing Maps, Apple Maps, OpenStreetMap, OpenTopoMap, and Wikimedia Maps.
+*   **Two viewing modes:**
+    *   **Webview:** Opens the location in a dockable panel inside QGIS. You can dock it to any side of the QGIS window or leave it floating.
+    *   **Browser:** Opens the location in your system's default web browser, either as a one-off snapshot or in live-follow mode.
+*   **Live-follow:** In webview mode (and optionally in browser mode), the map view updates automatically as you pan and zoom the QGIS canvas, debounced to avoid excessive reloads.
+*   **Configurable via Settings:** Choose your default provider and viewing mode (webview or browser) once in the settings dialog; the context menu then reflects that choice with a single click.
+*   **Coordinate transformation:** Automatically transforms coordinates from your project's CRS to WGS 84 (EPSG:4326) for compatibility with web maps.
 
 ## Installation
-<!--
-### From QGIS Plugin Repository (Recommended)
+
+### From QGIS Plugin Repository
 
 1.  Open QGIS.
 2.  Go to `Plugins` -> `Manage and Install Plugins...`.
 3.  Search for `QuickMapLink`.
 4.  Select the plugin and click `Install Plugin`.
 
-*(Note: You will need to package and upload your plugin to the official QGIS repository for this method to work.)*
--->
 ### Manual Installation
 
-1.  Download the latest plugin release `.zip` file from the Releases page ([Repo link](https://github.com/Siddh75/quick_map_link/releases/tag/v1.2)).
+1.  Download the latest plugin release `.zip` from the [Releases page](https://github.com/Siddh75/quick_map_link/releases).
 2.  Open QGIS.
 3.  Go to `Plugins` -> `Manage and Install Plugins...`.
 4.  Switch to the `Install from ZIP` tab.
@@ -50,37 +40,30 @@ Opens web maps (Google Maps, Bing Maps, or Apple Maps) in a separate window or b
 
 ## Usage
 
-1.  Once installed and enabled, simply **right-click** anywhere on the QGIS map canvas.
-2.  You will see two new options (if the toolbar button is active):
-    *   `Open Map Here (Webview)`: Opens the location in a new window inside QGIS using the map provider selected in settings.
-    *   `Open Map Here (Browser)`: Opens the location in your default web browser using the map provider selected in settings.
-3.  Click the desired option.
-4.  **Toolbar Button:** Find the QuickMapLink icon (icon.png) in your QGIS toolbars. Clicking this button toggles the visibility of the `Open Map Here...` options in the right-click context menu.
+1.  Once installed and enabled, **right-click** anywhere on the QGIS map canvas.
+2.  Click the `Open in <Provider>` entry that appears in the context menu. It opens in whichever mode (webview or browser) you've configured in Settings.
+3.  In webview mode, the panel can be docked to any edge of the QGIS window or left floating, and will live-follow your QGIS view as you pan and zoom.
 
 ## Configuration
 
-To change the default map provider:
-
-1.  Go to the QGIS menu: `Plugins` -> `QuickMapLink` -> `Map Settings`.
-2.  A dialog box will appear. Select your preferred map provider (Google Maps, Bing Maps, or Apple Maps) from the dropdown menu.
-3.  Click `Save`.
-
-The selected provider will now be used when you choose either the "Webview" or "Browser" option from the context menu.
+1.  Go to the QGIS menu: `Plugins` -> `QuickMapLink`.
+2.  In the settings dialog, check `Enable` to activate the context menu entry.
+3.  Choose your preferred map provider and viewing mode (Webview or Browser).
+4.  If using Browser mode, optionally enable live-follow (a new tab opens on every canvas movement — a confirmation prompt explains this before you turn it on).
+5.  Click `Save`. Open webviews refresh immediately to reflect the new settings.
 
 ## Compatibility
 
-*   **QGIS:** Requires QGIS version 3.0 or higher.
-*   **Web View:** This plugin currently uses `QWebView` for the embedded map view. `QWebView` is based on an older WebKit engine and is deprecated in newer Qt versions (which QGIS uses). While it should work on many QGIS 3.x installations, it might be removed in future QGIS releases. If the embedded view stops working in a future QGIS version, the "Open in Browser" option should still function. An update to use `QWebEngineView` might be required for future compatibility.
+*   **QGIS:** Requires QGIS 3.16 or higher (the plugin relies on `QgsMapCanvas.contextMenuAboutToShow`, introduced in 3.16).
+*   **Webview:** Uses `QWebEngineView` where available, with a `QWebView` (QtWebKit) fallback on installations without QtWebEngine. Some providers that rely on modern JavaScript (e.g. OpenStreetMap) are automatically restricted to Browser mode when only the QtWebKit fallback is available, since QtWebKit cannot render their pages correctly.
 
 ## Contributing
 
-Contributions are welcome! If you find a bug or have a feature request, please open an issue. If you'd like to contribute code, please feel free to fork the repository and submit a pull request.
+Contributions are welcome. If you find a bug or have a feature request, please [open an issue](https://github.com/Siddh75/quick_map_link/issues). To contribute code, fork the repository and submit a pull request.
 
 ## License
 
-This project is licensed under the **[Choose a License - e.g., GNU General Public License v2.0 or later (GPLv2+)]** - see the `LICENSE` file for details.
-
-*(**Important:** You need to choose an open-source license (like GPLv2+ which is common for QGIS plugins, or MIT, Apache 2.0, etc.) and add a corresponding `LICENSE` file to your repository.)*
+This project is licensed under the GNU General Public License v2.0 or later (GPLv2+) — see the [`LICENSE`](LICENSE) file for details.
 
 ## Author
 

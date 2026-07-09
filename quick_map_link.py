@@ -1,6 +1,29 @@
-from qgis.PyQt.QtWebKitWidgets import QWebView  # Use QWebView for QGIS < 3.6
+import os
+
+# Even with QWebEngineView (Chromium, out-of-process rendering), heavy WebGL/canvas-based
+# sites can still take the whole host app down if the bundled Chromium's GPU process hits a
+# driver bug -- this is a known failure mode on macOS in particular, and Bing Maps' modern
+# map renderer is GPU-heavy in a way Google's/Apple's simpler embeds aren't. Forcing software
+# rendering (no GPU process) trades a bit of smoothness for not crashing. These must be set
+# before QtWebEngine spins up its first render process, so set them before importing it.
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-gpu-compositing --disable-software-rasterizer")
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+
+# Bing Maps (and other modern, JS-heavy map sites) can crash QGIS outright when
+# rendered with the legacy, in-process QtWebKit engine (QWebView) -- WebKit here is
+# unmaintained since Qt 5.6 and a renderer fault takes the whole QGIS process with it.
+# QWebEngineView (QtWebEngine/Chromium) runs its renderer out-of-process and is what
+# QGIS's own browser panel uses, so we prefer it and only fall back to QWebView if a
+# particular QGIS build wasn't compiled with QtWebEngine support.
+try:
+    from qgis.PyQt.QtWebEngineWidgets import QWebEngineView as WebView
+    USING_WEBENGINE = True
+except ImportError:
+    from qgis.PyQt.QtWebKitWidgets import QWebView as WebView  # Fallback for QGIS < 3.6 / no QtWebEngine
+    USING_WEBENGINE = False
+
 from qgis.PyQt.QtWidgets import QAction, QMainWindow, QVBoxLayout, QWidget, QMenu, QDialog, QComboBox, QLabel, \
-    QPushButton, QVBoxLayout, QToolBar
+    QPushButton, QVBoxLayout, QToolBar, QMessageBox
 from qgis.core import QgsProject, QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsRectangle
 from qgis.gui import QgisInterface
 from qgis.PyQt.QtCore import Qt, QUrl, QSettings, QSize, QTimer  # Import QUrl, QSettings, QTimer from qgis.PyQt.QtCore
@@ -10,11 +33,36 @@ import math
 
 from .resources import *
 
-# Base map style options offered in the settings UI, and how each provider maps them.
+# Full superset of options, used as a fallback for any provider not listed below.
 BASEMAP_OPTIONS = ["Roadmap", "Satellite", "Terrain"]
-# Overlay options offered in the settings UI, and how each provider maps them
-# (providers that don't support a given overlay just fall back to "no overlay").
 OVERLAY_OPTIONS = ["None", "Traffic", "Transit", "Bicycling"]
+
+# What each provider actually supports -- the settings dialog filters its "Base map
+# style" and "Overlay layer" dropdowns to these lists based on the selected provider,
+# instead of always showing options that don't apply (e.g. "Terrain" for Bing, or any
+# basemap switch at all for the single-style OSM-based providers).
+PROVIDER_BASEMAPS = {
+    "Google Maps": ["Roadmap", "Satellite", "Terrain"],
+    "Bing Maps": ["Roadmap", "Satellite"],
+    "Apple Maps": ["Roadmap", "Satellite"],
+    "OpenStreetMap": ["Standard"],
+    "OpenTopoMap": ["Topographic"],
+    "Wikimedia Maps": ["Standard"],
+}
+PROVIDER_OVERLAYS = {
+    "Google Maps": ["None", "Traffic", "Transit", "Bicycling"],
+    "Bing Maps": ["None", "Traffic"],
+    "Apple Maps": ["None", "Transit"],
+    "OpenStreetMap": ["None", "Transit", "Bicycling"],
+    "OpenTopoMap": ["None"],
+    "Wikimedia Maps": ["None"],
+}
+
+
+def _strip_experimental_marker(map_type):
+    # Settings combo shows "Bing Maps *" / "Apple Maps *" (the "*" just flags them as
+    # experimental); strip it so it matches the plain provider name used everywhere else.
+    return (map_type or "Google Maps").replace("*", "").strip()
 
 
 class QuickMapLinkPlugin:
@@ -157,9 +205,7 @@ class QuickMapLinkPlugin:
         return zoom
 
     def _normalized_map_type(self):
-        # Settings combo shows "Bing Maps *" / "Apple Maps *" (the "*" just flags
-        # them as experimental); strip it so it matches the plain provider name.
-        return (self.map_type or "Google Maps").replace("*", "").strip()
+        return _strip_experimental_marker(self.map_type)
 
     def build_map_url(self, latitude, longitude):
         zoom = self.estimate_zoom_level()
@@ -169,6 +215,12 @@ class QuickMapLinkPlugin:
             return self._build_bing_url(latitude, longitude, zoom)
         elif provider == "Apple Maps":
             return self._build_apple_url(latitude, longitude, zoom)
+        elif provider == "OpenStreetMap":
+            return self._build_osm_url(latitude, longitude, zoom)
+        elif provider == "OpenTopoMap":
+            return self._build_opentopomap_url(latitude, longitude, zoom)
+        elif provider == "Wikimedia Maps":
+            return self._build_wikimedia_url(latitude, longitude, zoom)
         else:
             return self._build_google_url(latitude, longitude, zoom)  # default to Google Maps
 
@@ -203,28 +255,104 @@ class QuickMapLinkPlugin:
         zoom = round(max(2, min(21, zoom)))
         return f"https://maps.apple.com/?ll={latitude},{longitude}&z={zoom}&t={map_type}"
 
+    def _build_osm_url(self, latitude, longitude, zoom):
+        # https://wiki.openstreetmap.org/wiki/Browsing
+        # Single default render (Mapnik); the only real "layer" switch available is
+        # &layers=C (CyclOSM) or &layers=H (Humanitarian). Basemap style (satellite/
+        # terrain) doesn't apply -- OSM only has the one road-map style.
+        zoom = round(max(0, min(19, zoom)))
+        url = f"https://www.openstreetmap.org/?mlat={latitude}&mlon={longitude}#map={zoom}/{latitude}/{longitude}"
+        if self.overlay_layer == "Bicycling":
+            url += "&layers=C"
+        elif self.overlay_layer == "Transit":
+            url += "&layers=H"  # closest available match: Humanitarian OSM Team style
+        return url
+
+    def _build_opentopomap_url(self, latitude, longitude, zoom):
+        # https://opentopomap.org -- single topographic/contour style, no basemap or
+        # overlay options to switch (no satellite/traffic/transit equivalents).
+        zoom = round(max(0, min(17, zoom)))  # OpenTopoMap tiles top out around z17
+        return f"https://opentopomap.org/#map={zoom}/{latitude}/{longitude}"
+
+    def _build_wikimedia_url(self, latitude, longitude, zoom):
+        # https://maps.wikimedia.org -- single default OSM-based style, no basemap or
+        # overlay switches in the URL.
+        zoom = round(max(0, min(18, zoom)))
+        return f"https://maps.wikimedia.org/#{zoom}/{latitude}/{longitude}"
+
     def open_google_maps_at_location(self, point=None):
+        if not USING_WEBENGINE:
+            # QtWebEngine isn't available in this QGIS build, so we're stuck with the
+            # legacy QtWebKit renderer, which is the thing known to crash on heavy
+            # sites like Bing Maps. Warn loudly rather than fail silently.
+            print("[QuickMapLink] WARNING: QtWebEngine not found, falling back to QtWebKit's QWebView. "
+                  "This renderer is unmaintained and known to crash on modern map sites (e.g. Bing Maps). "
+                  "Consider using 'Open Map Here (Browser)' instead for those providers, or installing a "
+                  "QGIS build with QtWebEngine support.")
+
+        if self._normalized_map_type() == "Bing Maps":
+            # Bing's embedded map has been observed to hard-crash QGIS (silently, no error
+            # dialog) even under QWebEngineView -- most likely a GPU/graphics-driver crash
+            # inside the bundled Chromium engine that the software-rendering flags above
+            # don't always catch. Rather than risk losing unsaved QGIS work again, ask first.
+            choice = QMessageBox.warning(
+                self.iface.mainWindow(),
+                "Bing Maps (Webview) is unstable",
+                "The embedded Bing Maps view has been known to crash QGIS on some systems.\n\n"
+                "Open it in your default browser instead (safe), or continue in the embedded "
+                "webview anyway (risk of a crash)?",
+                QMessageBox.Open | QMessageBox.Ignore | QMessageBox.Cancel,
+                QMessageBox.Open,
+            )
+            if choice == QMessageBox.Cancel:
+                return
+            if choice == QMessageBox.Open:
+                self.open_google_maps_in_browser(point)
+                return
+            # choice == QMessageBox.Ignore: fall through and open the webview anyway
+
         self.window = QMainWindow()
         self.window.setWindowTitle(self.map_type + " (Webview)")
         self.window.setGeometry(100, 100, 800, 600)
 
-        self.webview = QWebView()  # Use QWebView instead of QWebEngineView
+        self.webview = WebView()  # QWebEngineView when available; QWebView as a last-resort fallback
+        try:
+            self.webview.loadFinished.connect(self._nudge_map_resize)
+        except AttributeError:
+            pass
+
+        central_widget = QWidget()
+        layout = QVBoxLayout()
+        layout.addWidget(self.webview)
+        central_widget.setLayout(layout)
+        self.window.setCentralWidget(central_widget)
+
+        # Show the window (giving the webview its final size) BEFORE loading the URL.
+        # Leaflet-based sites (OSM, OpenTopoMap, Wikimedia Maps) measure their container
+        # size when the map initializes; if setUrl() runs first, the widget is still 0x0
+        # (not yet laid out/shown), so the JS map inits at zero size and tiles never load
+        # -- you just get a blank grey pane even though the page itself loaded fine.
+        self.window.show()
 
         latitude, longitude = self.get_canvas_location(point)
         url = self.build_map_url(latitude, longitude)
 
         print(f"URL: {url}")
         self.webview.setUrl(QUrl(url))  # Create a QUrl object
-
-        central_widget = QWidget()
-        layout = QVBoxLayout()
-        layout.addWidget(self.webview)
-        central_widget.setLayout(layout)
-
-        self.window.setCentralWidget(central_widget)
-        self.window.show()
         # From here on, _on_canvas_extents_changed will keep this window in sync
         # with the QGIS view finder for as long as it stays open (self.window.isVisible()).
+
+    def _nudge_map_resize(self, ok=True):
+        """Some JS map libraries (Leaflet in particular) still mis-measure their
+        container on first paint even when shown before load. Dispatching a resize
+        event after the page finishes loading makes them recompute and fill in tiles."""
+        if not ok or self.webview is None:
+            return
+        js = "window.dispatchEvent(new Event('resize'));"
+        if USING_WEBENGINE:
+            self.webview.page().runJavaScript(js)
+        else:  # QWebView (QtWebKit) fallback
+            self.webview.page().mainFrame().evaluateJavaScript(js)
 
     def open_google_maps_in_browser(self, point=None):
         latitude, longitude = self.get_canvas_location(point)
@@ -249,27 +377,46 @@ class QuickMapLinkPlugin:
         layout.addWidget(map_type_label)
         layout.addWidget(experimental_label)
         map_type_combo = QComboBox()
-        map_type_combo.addItems(["Google Maps", "Bing Maps *", "Apple Maps *"])
+        map_type_combo.addItems([
+            "Google Maps", "Bing Maps *", "Apple Maps *",
+            "OpenStreetMap", "OpenTopoMap", "Wikimedia Maps",
+        ])
         map_type_combo.setCurrentText(self.map_type)
         layout.addWidget(map_type_combo)
 
-        # Base Map Style Selection
+        # Base Map Style Selection (options depend on the selected provider)
         basemap_label = QLabel("Base map style:")
         layout.addWidget(basemap_label)
         basemap_combo = QComboBox()
-        basemap_combo.addItems(BASEMAP_OPTIONS)
-        basemap_combo.setCurrentText(self.basemap_style)
         layout.addWidget(basemap_combo)
 
-        # Overlay Layer Selection
+        # Overlay Layer Selection (options depend on the selected provider)
         overlay_label = QLabel("Overlay layer:")
-        overlay_note = QLabel("* Not every overlay is supported by every provider.")
         layout.addWidget(overlay_label)
-        layout.addWidget(overlay_note)
         overlay_combo = QComboBox()
-        overlay_combo.addItems(OVERLAY_OPTIONS)
-        overlay_combo.setCurrentText(self.overlay_layer)
         layout.addWidget(overlay_combo)
+
+        def refresh_provider_options(preferred_basemap=None, preferred_overlay=None):
+            provider = _strip_experimental_marker(map_type_combo.currentText())
+            basemaps = PROVIDER_BASEMAPS.get(provider, BASEMAP_OPTIONS)
+            overlays = PROVIDER_OVERLAYS.get(provider, OVERLAY_OPTIONS)
+
+            basemap_combo.blockSignals(True)
+            basemap_combo.clear()
+            basemap_combo.addItems(basemaps)
+            basemap_combo.setCurrentText(preferred_basemap if preferred_basemap in basemaps else basemaps[0])
+            basemap_combo.blockSignals(False)
+
+            overlay_combo.blockSignals(True)
+            overlay_combo.clear()
+            overlay_combo.addItems(overlays)
+            overlay_combo.setCurrentText(preferred_overlay if preferred_overlay in overlays else overlays[0])
+            overlay_combo.blockSignals(False)
+
+        # Populate using the plugin's current saved choices, then re-filter (dropping
+        # any selection the new provider doesn't support) whenever the provider changes.
+        refresh_provider_options(self.basemap_style, self.overlay_layer)
+        map_type_combo.currentTextChanged.connect(lambda _: refresh_provider_options())
 
         # Save Button
         save_button = QPushButton("Save")

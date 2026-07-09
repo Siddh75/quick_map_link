@@ -22,8 +22,8 @@ except ImportError:
     from qgis.PyQt.QtWebKitWidgets import QWebView as WebView  # Fallback for QGIS < 3.6 / no QtWebEngine
     USING_WEBENGINE = False
 
-from qgis.PyQt.QtWidgets import QAction, QMainWindow, QVBoxLayout, QWidget, QDialog, QComboBox, QLabel, \
-    QPushButton, QVBoxLayout, QToolBar, QCheckBox
+from qgis.PyQt.QtWidgets import QAction, QVBoxLayout, QDialog, QComboBox, QLabel, \
+    QPushButton, QToolBar, QCheckBox, QDockWidget
 from qgis.core import QgsProject, QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsRectangle
 from qgis.gui import QgisInterface
 from qgis.PyQt.QtCore import Qt, QUrl, QSettings, QSize, QTimer  # Import QUrl, QSettings, QTimer from qgis.PyQt.QtCore
@@ -130,6 +130,11 @@ class QuickMapLinkPlugin:
         self.iface.removePluginMenu("QuickMapLink", self.settings_action)
         self.iface.mapCanvas().contextMenuAboutToShow.disconnect(self._populate_context_menu)
         self.iface.mapCanvas().extentsChanged.disconnect(self._on_canvas_extents_changed)
+
+        if self.window is not None:
+            self.iface.removeDockWidget(self.window)
+            self.window = None
+            self.webview = None
 
         # Remove toolbar button
         self.iface.removeToolBarIcon(self.settings_action)
@@ -332,35 +337,43 @@ class QuickMapLinkPlugin:
                   "This renderer is unmaintained and may crash on some map sites. Consider switching "
                   "'Open in' to Browser in Map Settings, or installing a QGIS build with QtWebEngine support.")
 
-        self.window = QMainWindow()
-        self.window.setWindowTitle("Quick Map Link (Webview)")
-        self.window.setGeometry(100, 100, 800, 600)
+        if self.window is None:
+            # A QDockWidget instead of a plain floating window: it can be dragged to
+            # any edge of the QGIS window and docked there, or dragged back out to
+            # float, the same way QGIS's own Layers/Browser panels work. It starts
+            # floating (like the old window did) but the user can pin it wherever
+            # they like. Created once and reused on later opens, rather than piling
+            # up a new window every time "Open in Webview" is used.
+            self.window = QDockWidget("Quick Map Link (Webview)", self.iface.mainWindow())
+            self.window.setObjectName("QuickMapLinkWebviewDock")  # lets QGIS remember its position
+            self.window.setFeatures(QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable
+                                     | QDockWidget.DockWidgetFloatable)
 
-        self.webview = WebView()  # QWebEngineView when available; QWebView as a last-resort fallback
-        try:
-            self.webview.loadFinished.connect(self._nudge_map_resize)
-        except AttributeError:
-            pass
+            self.webview = WebView()  # QWebEngineView when available; QWebView as a last-resort fallback
+            try:
+                self.webview.loadFinished.connect(self._nudge_map_resize)
+            except AttributeError:
+                pass
+            self.window.setWidget(self.webview)
 
-        central_widget = QWidget()
-        layout = QVBoxLayout()
-        layout.addWidget(self.webview)
-        central_widget.setLayout(layout)
-        self.window.setCentralWidget(central_widget)
+            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.window)
+            self.window.setFloating(True)
+            self.window.resize(800, 600)
 
-        # Show the window (giving the webview its final size) BEFORE loading the URL.
+        # Show the dock (giving the webview its final size) BEFORE loading the URL.
         # Leaflet-based sites (OSM, OpenTopoMap, Wikimedia Maps) measure their container
         # size when the map initializes; if setUrl() runs first, the widget is still 0x0
         # (not yet laid out/shown), so the JS map inits at zero size and tiles never load
         # -- you just get a blank grey pane even though the page itself loaded fine.
         self.window.show()
+        self.window.raise_()
 
         latitude, longitude = self.get_canvas_location(point)
         url = self.build_map_url(latitude, longitude)
 
         print(f"URL: {url}")
         self.webview.setUrl(QUrl(url))  # Create a QUrl object
-        # From here on, _on_canvas_extents_changed will keep this window in sync
+        # From here on, _on_canvas_extents_changed will keep this dock in sync
         # with the QGIS view finder for as long as it stays open (self.window.isVisible()).
 
     def _nudge_map_resize(self, ok=True):

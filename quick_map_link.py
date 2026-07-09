@@ -83,7 +83,7 @@ class QuickMapLinkPlugin:
         # on/off toolbar toggle is gone -- that switch now lives inside the settings
         # dialog itself (see open_settings_dialog) so there's only one icon to find.
         self.settings_action = QAction(QIcon(":/plugins/quick_map_link/icon.png"),
-                                        "Map Settings", self.iface.mainWindow())
+                                        "QuickMapLink", self.iface.mainWindow())
         self.settings_action.setToolTip("Open Quick Map Link settings")
         self.settings_action.triggered.connect(self.open_settings_dialog)
 
@@ -109,8 +109,10 @@ class QuickMapLinkPlugin:
         self._follow_timer.timeout.connect(self._on_canvas_settled)
 
     def initGui(self):
-        # Add the settings action to the plugin menu
-        self.iface.addPluginToMenu("QuickMapLink", self.settings_action)
+        # Add directly to the Plugins menu itself (rather than addPluginToMenu, which
+        # would wrap a single action in its own "QuickMapLink" submenu) so it's one
+        # directly-clickable item, consistent with "Python Console" etc. above it.
+        self.iface.pluginMenu().addAction(self.settings_action)
 
         # Add our entry directly into QGIS's own native canvas right-click menu (the one
         # that already has "Copy Coordinate" etc.), instead of showing a second, separate
@@ -127,7 +129,7 @@ class QuickMapLinkPlugin:
         self.toolbar.addAction(self.settings_action)
 
     def unload(self):
-        self.iface.removePluginMenu("QuickMapLink", self.settings_action)
+        self.iface.pluginMenu().removeAction(self.settings_action)
         self.iface.mapCanvas().contextMenuAboutToShow.disconnect(self._populate_context_menu)
         self.iface.mapCanvas().extentsChanged.disconnect(self._on_canvas_extents_changed)
 
@@ -493,6 +495,11 @@ class QuickMapLinkPlugin:
         self.settings.setValue("overlay_layer", overlay_layer)
         self.settings.setValue("context_menu_enabled", context_menu_enabled)
         dialog.close()
+
+        # If the webview is already open, refresh it immediately with the new provider/
+        # basemap/overlay instead of waiting for the next canvas pan/zoom to trigger it.
+        if self.window is not None and self.window.isVisible():
+            self._on_canvas_settled()
 
 
 def classFactory(iface):

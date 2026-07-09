@@ -16,11 +16,27 @@ os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 # QGIS's own browser panel uses, so we prefer it and only fall back to QWebView if a
 # particular QGIS build wasn't compiled with QtWebEngine support.
 try:
-    from qgis.PyQt.QtWebEngineWidgets import QWebEngineView as WebView
+    from qgis.PyQt.QtWebEngineWidgets import QWebEngineView as WebView, QWebEnginePage
     USING_WEBENGINE = True
+
+    class _DiagnosticWebEnginePage(QWebEnginePage):
+        """Forwards the page's own JS console output (fetch/tile errors, blocked
+        requests, CSP violations, etc.) to the QGIS Python console. This is usually
+        the only way to see *why* a map failed to render -- a broken tile request
+        or a blocked script doesn't raise anything at the Qt/Python level, it just
+        shows up as a console.error() inside the page."""
+        def javaScriptConsoleMessage(self, level, message, line, source):
+            print(f"[QuickMapLink][JS] {message} (line {line} in {source})")
+
 except ImportError:
-    from qgis.PyQt.QtWebKitWidgets import QWebView as WebView  # Fallback for QGIS < 3.6 / no QtWebEngine
+    from qgis.PyQt.QtWebKitWidgets import QWebView as WebView, QWebPage  # Fallback for QGIS < 3.6 / no QtWebEngine
     USING_WEBENGINE = False
+
+    class _DiagnosticWebPage(QWebPage):
+        """Same idea as _DiagnosticWebEnginePage above, for the legacy QtWebKit engine
+        (older signature: no severity level)."""
+        def javaScriptConsoleMessage(self, message, line, source):
+            print(f"[QuickMapLink][JS] {message} (line {line} in {source})")
 
 from qgis.PyQt.QtWidgets import QAction, QVBoxLayout, QDialog, QComboBox, QLabel, \
     QPushButton, QToolBar, QCheckBox, QDockWidget
@@ -63,6 +79,14 @@ PROVIDER_OVERLAYS = {
 # an embedded Chromium view. Both are browser-only -- Webview isn't offered for them.
 PROVIDERS_WITHOUT_WEBVIEW = {"Bing Maps", "Apple Maps"}
 
+# Providers confirmed broken specifically under the legacy QtWebKit fallback (i.e. only
+# when QtWebEngine isn't available at all) -- their JS bundle uses syntax that engine's
+# frozen JS parser can't handle. OSM confirmed via JS console forwarding: a SyntaxError
+# on object-spread syntax ('...') in its main bundle. Google Maps, OpenTopoMap, and
+# Wikimedia Maps have all been confirmed to render fine on the same QtWebKit fallback,
+# so this is deliberately narrow rather than disabling Webview for everything.
+PROVIDERS_BROKEN_ON_WEBKIT = {"OpenStreetMap"}
+
 # Empirical correction: Apple Maps' "z" URL parameter renders more zoomed-out than the
 # same numeric value on Google/Bing/OSM at the shared zoom estimate, so it undershoots
 # how zoomed-in the QGIS view actually is. See _build_apple_url.
@@ -73,6 +97,15 @@ def _strip_experimental_marker(map_type):
     # Settings combo shows "Bing Maps *" / "Apple Maps *" (the "*" just flags them as
     # experimental); strip it so it matches the plain provider name used everywhere else.
     return (map_type or "Google Maps").replace("*", "").strip()
+
+
+def _webview_disabled(provider):
+    """True if Webview mode shouldn't be offered for this provider at all."""
+    if provider in PROVIDERS_WITHOUT_WEBVIEW:
+        return True
+    if not USING_WEBENGINE and provider in PROVIDERS_BROKEN_ON_WEBKIT:
+        return True
+    return False
 
 
 class QuickMapLinkPlugin:
@@ -183,8 +216,10 @@ class QuickMapLinkPlugin:
 
         self.context_point = event  # has .x()/.y(), same as the QPoint it replaces
         provider = self._normalized_map_type()
-        # Bing/Apple are browser-only regardless of the saved "Open in" setting.
-        effective_open_mode = "Browser" if provider in PROVIDERS_WITHOUT_WEBVIEW else self.open_mode
+        # Bing/Apple are browser-only regardless of the saved "Open in" setting; OSM is
+        # also browser-only specifically when QtWebEngine isn't available (see
+        # PROVIDERS_BROKEN_ON_WEBKIT) -- everything else works fine on either engine.
+        effective_open_mode = "Browser" if _webview_disabled(provider) else self.open_mode
 
         menu.addSeparator()
         if effective_open_mode == "Browser":
@@ -331,13 +366,20 @@ class QuickMapLinkPlugin:
             self.open_google_maps_in_browser(point)
             return
 
+        if not USING_WEBENGINE and provider in PROVIDERS_BROKEN_ON_WEBKIT:
+            # Confirmed via JS console forwarding: this provider's bundle uses syntax
+            # (e.g. OSM's object-spread) that QtWebKit's frozen JS engine can't parse --
+            # the page loads but silently fails to render anything. Google Maps,
+            # OpenTopoMap, and Wikimedia Maps are all fine on this same fallback engine,
+            # so only providers actually confirmed broken get redirected to the browser.
+            print(f"[QuickMapLink] {provider} doesn't render on the QtWebKit fallback renderer "
+                  f"(no QtWebEngine on this QGIS build). Opening in browser instead.")
+            self.open_google_maps_in_browser(point)
+            return
+
         if not USING_WEBENGINE:
-            # QtWebEngine isn't available in this QGIS build, so we're stuck with the
-            # legacy QtWebKit renderer, which is unmaintained and known to crash on
-            # heavy, modern map sites. Warn loudly rather than fail silently.
-            print("[QuickMapLink] WARNING: QtWebEngine not found, falling back to QtWebKit's QWebView. "
-                  "This renderer is unmaintained and may crash on some map sites. Consider switching "
-                  "'Open in' to Browser in Map Settings, or installing a QGIS build with QtWebEngine support.")
+            print(f"[QuickMapLink] QtWebEngine not found; using the legacy QtWebKit renderer "
+                  f"for {provider}.")
 
         if self.window is None:
             # A QDockWidget instead of a plain floating window: it can be dragged to
@@ -352,8 +394,18 @@ class QuickMapLinkPlugin:
                                      | QDockWidget.DockWidgetFloatable)
 
             self.webview = WebView()  # QWebEngineView when available; QWebView as a last-resort fallback
+            # A page subclass that forwards the page's own JS console output (fetch/tile
+            # errors, CSP violations, etc.) to the QGIS Python console -- this is usually
+            # the only way to see *why* a map failed to render, since the page itself won't
+            # raise a Qt-level error for e.g. a blocked or failed tile request.
+            if USING_WEBENGINE:
+                self.webview.setPage(_DiagnosticWebEnginePage(self.webview))
+            else:
+                self.webview.setPage(_DiagnosticWebPage(self.webview))
             try:
-                self.webview.loadFinished.connect(self._nudge_map_resize)
+                self.webview.loadStarted.connect(
+                    lambda: print("[QuickMapLink] loadStarted"))
+                self.webview.loadFinished.connect(self._on_webview_load_finished)
             except AttributeError:
                 pass
             self.window.setWidget(self.webview)
@@ -377,6 +429,11 @@ class QuickMapLinkPlugin:
         self.webview.setUrl(QUrl(url))  # Create a QUrl object
         # From here on, _on_canvas_extents_changed will keep this dock in sync
         # with the QGIS view finder for as long as it stays open (self.window.isVisible()).
+
+    def _on_webview_load_finished(self, ok):
+        current_url = self.webview.url().toString() if self.webview is not None else "?"
+        print(f"[QuickMapLink] loadFinished(ok={ok}) url={current_url}")
+        self._nudge_map_resize(ok)
 
     def _nudge_map_resize(self, ok=True):
         """Some JS map libraries (Leaflet in particular) still mis-measure their
@@ -416,11 +473,15 @@ class QuickMapLinkPlugin:
         layout.addWidget(map_type_combo)
 
         # Open Mode Selection -- determines what the single right-click menu entry does.
-        # Options depend on the selected provider (Bing/Apple are browser-only).
+        # Options depend on the selected provider (some are browser-only).
         open_mode_label = QLabel("Open in:")
         layout.addWidget(open_mode_label)
         open_mode_combo = QComboBox()
         layout.addWidget(open_mode_combo)
+        open_mode_note = QLabel()
+        open_mode_note.setWordWrap(True)
+        open_mode_note.setVisible(False)
+        layout.addWidget(open_mode_note)
 
         # Base Map Style Selection (options depend on the selected provider)
         basemap_label = QLabel("Base map style:")
@@ -442,7 +503,8 @@ class QuickMapLinkPlugin:
 
         def refresh_provider_options(preferred_open_mode=None, preferred_basemap=None, preferred_overlay=None):
             provider = _strip_experimental_marker(map_type_combo.currentText())
-            open_modes = ["Browser"] if provider in PROVIDERS_WITHOUT_WEBVIEW else ["Webview", "Browser"]
+            disabled = _webview_disabled(provider)
+            open_modes = ["Browser"] if disabled else ["Webview", "Browser"]
             basemaps = PROVIDER_BASEMAPS.get(provider, BASEMAP_OPTIONS)
             overlays = PROVIDER_OVERLAYS.get(provider, OVERLAY_OPTIONS)
 
@@ -451,6 +513,17 @@ class QuickMapLinkPlugin:
             open_mode_combo.addItems(open_modes)
             open_mode_combo.setCurrentText(preferred_open_mode if preferred_open_mode in open_modes else open_modes[0])
             open_mode_combo.blockSignals(False)
+
+            if provider in PROVIDERS_WITHOUT_WEBVIEW:
+                open_mode_note.setText(f"* Webview isn't offered for {provider} (browser-only).")
+                open_mode_note.setVisible(True)
+            elif not USING_WEBENGINE and provider in PROVIDERS_BROKEN_ON_WEBKIT:
+                open_mode_note.setText(
+                    f"* Webview isn't offered for {provider}: this QGIS build has no QtWebEngine, "
+                    f"and {provider}'s map doesn't render on the fallback renderer.")
+                open_mode_note.setVisible(True)
+            else:
+                open_mode_note.setVisible(False)
 
             basemap_combo.blockSignals(True)
             basemap_combo.clear()

@@ -16,27 +16,11 @@ os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 # QGIS's own browser panel uses, so we prefer it and only fall back to QWebView if a
 # particular QGIS build wasn't compiled with QtWebEngine support.
 try:
-    from qgis.PyQt.QtWebEngineWidgets import QWebEngineView as WebView, QWebEnginePage
+    from qgis.PyQt.QtWebEngineWidgets import QWebEngineView as WebView
     USING_WEBENGINE = True
-
-    class _DiagnosticWebEnginePage(QWebEnginePage):
-        """Forwards the page's own JS console output (fetch/tile errors, blocked
-        requests, CSP violations, etc.) to the QGIS Python console. This is usually
-        the only way to see *why* a map failed to render -- a broken tile request
-        or a blocked script doesn't raise anything at the Qt/Python level, it just
-        shows up as a console.error() inside the page."""
-        def javaScriptConsoleMessage(self, level, message, line, source):
-            print(f"[QuickMapLink][JS] {message} (line {line} in {source})")
-
 except ImportError:
-    from qgis.PyQt.QtWebKitWidgets import QWebView as WebView, QWebPage  # Fallback for QGIS < 3.6 / no QtWebEngine
+    from qgis.PyQt.QtWebKitWidgets import QWebView as WebView  # Fallback for QGIS < 3.6 / no QtWebEngine
     USING_WEBENGINE = False
-
-    class _DiagnosticWebPage(QWebPage):
-        """Same idea as _DiagnosticWebEnginePage above, for the legacy QtWebKit engine
-        (older signature: no severity level)."""
-        def javaScriptConsoleMessage(self, message, line, source):
-            print(f"[QuickMapLink][JS] {message} (line {line} in {source})")
 
 from qgis.PyQt.QtWidgets import QAction, QVBoxLayout, QDialog, QComboBox, QLabel, \
     QPushButton, QToolBar, QCheckBox, QDockWidget, QMessageBox
@@ -206,7 +190,6 @@ class QuickMapLinkPlugin:
             return
         latitude, longitude = self.get_canvas_location()
         url = self.build_map_url(latitude, longitude)
-        print(f"[QuickMapLink] Following webview to: {url}")
         self.webview.setUrl(QUrl(url))
 
     def _on_browser_follow_settled(self):
@@ -216,7 +199,6 @@ class QuickMapLinkPlugin:
         latitude, longitude = self.get_canvas_location()
         self._last_browser_location = (latitude, longitude)
         url = self.build_map_url(latitude, longitude)
-        print(f"[QuickMapLink] Following browser to: {url}")
         webbrowser.open(url)
 
     def toggle_browser_follow(self, checked):
@@ -422,14 +404,8 @@ class QuickMapLinkPlugin:
             # the page loads but silently fails to render anything. Google Maps,
             # OpenTopoMap, and Wikimedia Maps are all fine on this same fallback engine,
             # so only providers actually confirmed broken get redirected to the browser.
-            print(f"[QuickMapLink] {provider} doesn't render on the QtWebKit fallback renderer "
-                  f"(no QtWebEngine on this QGIS build). Opening in browser instead.")
             self.open_google_maps_in_browser(point)
             return
-
-        if not USING_WEBENGINE:
-            print(f"[QuickMapLink] QtWebEngine not found; using the legacy QtWebKit renderer "
-                  f"for {provider}.")
 
         if self.window is None:
             # A QDockWidget instead of a plain floating window: it can be dragged to
@@ -444,17 +420,7 @@ class QuickMapLinkPlugin:
                                      | QDockWidget.DockWidgetFloatable)
 
             self.webview = WebView()  # QWebEngineView when available; QWebView as a last-resort fallback
-            # A page subclass that forwards the page's own JS console output (fetch/tile
-            # errors, CSP violations, etc.) to the QGIS Python console -- this is usually
-            # the only way to see *why* a map failed to render, since the page itself won't
-            # raise a Qt-level error for e.g. a blocked or failed tile request.
-            if USING_WEBENGINE:
-                self.webview.setPage(_DiagnosticWebEnginePage(self.webview))
-            else:
-                self.webview.setPage(_DiagnosticWebPage(self.webview))
             try:
-                self.webview.loadStarted.connect(
-                    lambda: print("[QuickMapLink] loadStarted"))
                 self.webview.loadFinished.connect(self._on_webview_load_finished)
             except AttributeError:
                 pass
@@ -475,14 +441,11 @@ class QuickMapLinkPlugin:
         latitude, longitude = self.get_canvas_location(point)
         url = self.build_map_url(latitude, longitude)
 
-        print(f"URL: {url}")
         self.webview.setUrl(QUrl(url))  # Create a QUrl object
         # From here on, _on_canvas_extents_changed will keep this dock in sync
         # with the QGIS view finder for as long as it stays open (self.window.isVisible()).
 
     def _on_webview_load_finished(self, ok):
-        current_url = self.webview.url().toString() if self.webview is not None else "?"
-        print(f"[QuickMapLink] loadFinished(ok={ok}) url={current_url}")
         self._nudge_map_resize(ok)
 
     def _nudge_map_resize(self, ok=True):
@@ -501,7 +464,6 @@ class QuickMapLinkPlugin:
         latitude, longitude = self.get_canvas_location(point)
         url = self.build_map_url(latitude, longitude)
 
-        print(f"URL: {url}")
         webbrowser.open(url)
 
     def open_settings_dialog(self):

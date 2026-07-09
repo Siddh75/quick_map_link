@@ -39,7 +39,7 @@ except ImportError:
             print(f"[QuickMapLink][JS] {message} (line {line} in {source})")
 
 from qgis.PyQt.QtWidgets import QAction, QVBoxLayout, QDialog, QComboBox, QLabel, \
-    QPushButton, QToolBar, QCheckBox, QDockWidget
+    QPushButton, QToolBar, QCheckBox, QDockWidget, QMessageBox
 from qgis.core import QgsProject, QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsRectangle
 from qgis.gui import QgisInterface
 from qgis.PyQt.QtCore import Qt, QUrl, QSettings, QSize, QTimer  # Import QUrl, QSettings, QTimer from qgis.PyQt.QtCore
@@ -92,6 +92,12 @@ PROVIDERS_BROKEN_ON_WEBKIT = {"OpenStreetMap"}
 # how zoomed-in the QGIS view actually is. See _build_apple_url.
 APPLE_MAPS_ZOOM_OFFSET = 2
 
+# Browser-follow can't update an already-open tab in place (webbrowser.open() always
+# risks a new tab), so it's throttled much harder than the webview: a long debounce
+# before it refreshes at all. Webview follow doesn't have this problem (setUrl() updates
+# in place) so it stays responsive.
+BROWSER_FOLLOW_DEBOUNCE_MS = 1000
+
 
 def _strip_experimental_marker(map_type):
     # Settings combo shows "Bing Maps *" / "Apple Maps *" (the "*" just flags them as
@@ -133,13 +139,20 @@ class QuickMapLinkPlugin:
         self.window = None          # internal webview window (tracked so we know if it's open)
         self.webview = None
         self.browser_follow_active = False  # whether browser-follow mode is currently active
+        self._last_browser_location = None  # (lat, lon) last actually opened, for the move-threshold check
 
-        # Debounce timer: coalesces rapid extentsChanged signals (e.g. while dragging the canvas)
-        # so we only push an update shortly after the view finder settles.
-        self._follow_timer = QTimer()
-        self._follow_timer.setSingleShot(True)
-        self._follow_timer.setInterval(400)  # ms after the canvas view stops moving
-        self._follow_timer.timeout.connect(self._on_canvas_settled)
+        # Webview follow: short debounce, coalesces rapid extentsChanged signals (e.g.
+        # while dragging the canvas) so we only push an update shortly after settling.
+        self._webview_follow_timer = QTimer()
+        self._webview_follow_timer.setSingleShot(True)
+        self._webview_follow_timer.setInterval(400)  # ms after the canvas view stops moving
+        self._webview_follow_timer.timeout.connect(self._on_webview_follow_settled)
+
+        # Browser follow: much longer debounce, since every refresh risks a new tab.
+        self._browser_follow_timer = QTimer()
+        self._browser_follow_timer.setSingleShot(True)
+        self._browser_follow_timer.setInterval(BROWSER_FOLLOW_DEBOUNCE_MS)
+        self._browser_follow_timer.timeout.connect(self._on_browser_follow_settled)
 
     def initGui(self):
         # Add directly to the Plugins menu itself (rather than addPluginToMenu, which
@@ -180,32 +193,63 @@ class QuickMapLinkPlugin:
     # Live-follow: react to the QGIS view finder moving
     # ------------------------------------------------------------------
     def _on_canvas_extents_changed(self):
-        # Only bother debouncing if something is actually listening for updates
-        if (self.window is not None and self.window.isVisible()) or self.browser_follow_active:
-            self._follow_timer.start()  # (re)starts the debounce window
+        # Two independent debounces: the webview updates in place (cheap, stays snappy),
+        # browser-follow risks a new tab per refresh (throttled much harder, see
+        # BROWSER_FOLLOW_DEBOUNCE_MS).
+        if self.window is not None and self.window.isVisible():
+            self._webview_follow_timer.start()
+        if self.browser_follow_active:
+            self._browser_follow_timer.start()
 
-    def _on_canvas_settled(self):
+    def _on_webview_follow_settled(self):
+        if self.window is None or not self.window.isVisible():
+            return
         latitude, longitude = self.get_canvas_location()
         url = self.build_map_url(latitude, longitude)
+        print(f"[QuickMapLink] Following webview to: {url}")
+        self.webview.setUrl(QUrl(url))
 
-        if self.window is not None and self.window.isVisible():
-            print(f"[QuickMapLink] Following webview to: {url}")
-            self.webview.setUrl(QUrl(url))
+    def _on_browser_follow_settled(self):
+        if not self.browser_follow_active:
+            return
 
-        if self.browser_follow_active:
-            print(f"[QuickMapLink] Following browser to: {url}")
-            webbrowser.open(url)
+        latitude, longitude = self.get_canvas_location()
+        self._last_browser_location = (latitude, longitude)
+        url = self.build_map_url(latitude, longitude)
+        print(f"[QuickMapLink] Following browser to: {url}")
+        webbrowser.open(url)
 
     def toggle_browser_follow(self, checked):
         if checked:
-            # First activation: open the tab immediately at the current point, then follow
-            self.open_google_maps_in_browser(getattr(self, "context_point", None))
+            # Live-follow means a new browser tab opens every time the QGIS view moves
+            # (browsers can't be updated in place from Python) -- confirm before turning
+            # it on rather than surprising the user with a flood of tabs.
+            seconds = BROWSER_FOLLOW_DEBOUNCE_MS / 1000
+            confirm = QMessageBox.warning(
+                self.iface.mainWindow(),
+                "Enable live follow in browser?",
+                f"While live follow is on, moving the QGIS view will open a new browser "
+                f"tab (at most about once every {seconds:g}s).\n\nEnable live follow?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return  # Declined -- leave follow off (menu rebuilds unchecked next time)
+
+            point = getattr(self, "context_point", None)
+            self.open_google_maps_in_browser(point)
             self.browser_follow_active = True
+            self._last_browser_location = self.get_canvas_location(point)
         else:
             self.browser_follow_active = False
+            self._last_browser_location = None
 
     def open_google_maps_context(self):
         self.open_google_maps_at_location(self.context_point)
+
+    def open_google_maps_context_browser(self):
+        # Plain one-shot snapshot -- does not touch browser_follow_active.
+        self.open_google_maps_in_browser(self.context_point)
 
     def _populate_context_menu(self, menu, event):
         """Add QuickMapLink's single "Open in <provider>" entry directly into QGIS's
@@ -223,12 +267,18 @@ class QuickMapLinkPlugin:
 
         menu.addSeparator()
         if effective_open_mode == "Browser":
-            label = f"Stop Following {provider} (Browser)" if self.browser_follow_active \
-                else f"Open in {provider} (Browser)"
-            action = menu.addAction(label)
-            action.setCheckable(True)
-            action.setChecked(self.browser_follow_active)
-            action.triggered.connect(self.toggle_browser_follow)
+            # Default behavior is a one-off snapshot -- opening a tab per click, not per
+            # QGIS view move. Live-follow is a separate, explicit opt-in (see
+            # toggle_browser_follow) since it means a new tab every time the view moves.
+            open_action = menu.addAction(f"Open in {provider} (Browser)")
+            open_action.triggered.connect(self.open_google_maps_context_browser)
+
+            follow_label = f"Stop Live Follow ({provider}, Browser)" if self.browser_follow_active \
+                else f"Live Follow ({provider}, Browser)"
+            follow_action = menu.addAction(follow_label)
+            follow_action.setCheckable(True)
+            follow_action.setChecked(self.browser_follow_active)
+            follow_action.triggered.connect(self.toggle_browser_follow)
         else:
             action = menu.addAction(f"Open in {provider} (Webview)")
             action.triggered.connect(self.open_google_maps_context)
@@ -459,17 +509,22 @@ class QuickMapLinkPlugin:
         dialog.setWindowTitle("QuickMapLink Settings")
         layout = QVBoxLayout()
 
+        # Enable/disable the right-click menu entry entirely (this used to be a separate
+        # toolbar toggle; it lives here now so there's only one QuickMapLink icon). Placed
+        # first since it gates whether everything below even applies.
+        enabled_checkbox = QCheckBox("Enable")
+        enabled_checkbox.setChecked(self.context_menu_enabled)
+        layout.addWidget(enabled_checkbox)
+
         # Map Type Selection
         map_type_label = QLabel("Select web map provider:")
-        experimental_label = QLabel("* Some providers are experimental and may not work perfectly.:")
         layout.addWidget(map_type_label)
-        layout.addWidget(experimental_label)
         map_type_combo = QComboBox()
         map_type_combo.addItems([
-            "Google Maps", "Bing Maps *", "Apple Maps *",
+            "Google Maps", "Bing Maps", "Apple Maps",
             "OpenStreetMap", "OpenTopoMap", "Wikimedia Maps",
         ])
-        map_type_combo.setCurrentText(self.map_type)
+        map_type_combo.setCurrentText(self._normalized_map_type())
         layout.addWidget(map_type_combo)
 
         # Open Mode Selection -- determines what the single right-click menu entry does.
@@ -495,11 +550,17 @@ class QuickMapLinkPlugin:
         overlay_combo = QComboBox()
         layout.addWidget(overlay_combo)
 
-        # Enable/disable the right-click menu entry entirely (this used to be a separate
-        # toolbar toggle; it lives here now so there's only one QuickMapLink icon).
-        enabled_checkbox = QCheckBox("Show QuickMapLink entry on the map canvas right-click menu")
-        enabled_checkbox.setChecked(self.context_menu_enabled)
-        layout.addWidget(enabled_checkbox)
+        # Everything above is moot while the entry itself is disabled -- grey it all out
+        # rather than leaving it clickable but pointless.
+        gated_widgets = [map_type_label, map_type_combo, open_mode_label, open_mode_combo,
+                          open_mode_note, basemap_label, basemap_combo, overlay_label, overlay_combo]
+
+        def apply_enabled_state(checked):
+            for widget in gated_widgets:
+                widget.setEnabled(checked)
+
+        apply_enabled_state(enabled_checkbox.isChecked())
+        enabled_checkbox.toggled.connect(apply_enabled_state)
 
         def refresh_provider_options(preferred_open_mode=None, preferred_basemap=None, preferred_overlay=None):
             provider = _strip_experimental_marker(map_type_combo.currentText())
@@ -572,7 +633,7 @@ class QuickMapLinkPlugin:
         # If the webview is already open, refresh it immediately with the new provider/
         # basemap/overlay instead of waiting for the next canvas pan/zoom to trigger it.
         if self.window is not None and self.window.isVisible():
-            self._on_canvas_settled()
+            self._on_webview_follow_settled()
 
 
 def classFactory(iface):

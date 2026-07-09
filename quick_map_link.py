@@ -6,8 +6,15 @@ from qgis.gui import QgisInterface
 from qgis.PyQt.QtCore import Qt, QUrl, QSettings, QSize, QTimer  # Import QUrl, QSettings, QTimer from qgis.PyQt.QtCore
 from qgis.PyQt.QtGui import QIcon
 import webbrowser
+import math
 
 from .resources import *
+
+# Base map style options offered in the settings UI, and how each provider maps them.
+BASEMAP_OPTIONS = ["Roadmap", "Satellite", "Terrain"]
+# Overlay options offered in the settings UI, and how each provider maps them
+# (providers that don't support a given overlay just fall back to "no overlay").
+OVERLAY_OPTIONS = ["None", "Traffic", "Transit", "Bicycling"]
 
 
 class QuickMapLinkPlugin:
@@ -22,9 +29,11 @@ class QuickMapLinkPlugin:
         self.settings_action = QAction("Map Settings", self.iface.mainWindow())
         self.settings_action.triggered.connect(self.open_settings_dialog)
 
-        # Load the default map type from settings
+        # Load the default map type / basemap style / overlay layer from settings
         self.settings = QSettings("MyOrganization", "QuickMapsLink Settings")
         self.map_type = self.settings.value("map_type", "Google Maps")
+        self.basemap_style = self.settings.value("basemap_style", "Roadmap")
+        self.overlay_layer = self.settings.value("overlay_layer", "None")
 
         # Toolbar button
         self.toolbar_button = QAction(QIcon(":/plugins/quick_map_link/icon.png"), "Toggle QuickMapLink", self.iface.mainWindow())
@@ -80,8 +89,8 @@ class QuickMapLinkPlugin:
             self._follow_timer.start()  # (re)starts the debounce window
 
     def _on_canvas_settled(self):
-        latitude, longitude, extent = self.get_canvas_location()
-        url = self.build_map_url(latitude, longitude, extent)
+        latitude, longitude = self.get_canvas_location()
+        url = self.build_map_url(latitude, longitude)
 
         if self.window is not None and self.window.isVisible():
             print(f"[QuickMapLink] Following webview to: {url}")
@@ -108,7 +117,7 @@ class QuickMapLinkPlugin:
     # Coordinate / URL helpers (shared by webview, browser, and follow-mode)
     # ------------------------------------------------------------------
     def get_canvas_location(self, point=None):
-        """Return (latitude, longitude, extent) in WGS84 for a given canvas-widget
+        """Return (latitude, longitude) in WGS84 for a given canvas-widget
         pixel point, or for the current canvas center if no point is given."""
         extent = self.iface.mapCanvas().extent()
 
@@ -123,17 +132,76 @@ class QuickMapLinkPlugin:
             transform = QgsCoordinateTransform(crs, QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance())
             map_point = transform.transform(map_point)
 
-        return map_point.y(), map_point.x(), extent
+        return map_point.y(), map_point.x()
 
-    def build_map_url(self, latitude, longitude, extent):
-        if self.map_type == "Google Maps":
-            return f"https://www.google.com/maps/@{latitude},{longitude},{extent.height()}m"
-        elif self.map_type == "Bing Maps":
-            return f"https://www.bing.com/maps?cp={latitude}~{longitude}&lvl=20"
-        elif self.map_type == "Apple Maps":
-            return f"https://beta.maps.apple.com/?ll={latitude},{longitude}&z=20"
+    def estimate_zoom_level(self):
+        """Approximate a web-mercator zoom level that matches how zoomed-in the
+        current QGIS canvas view is, so the opened map roughly matches what's
+        visible in QGIS instead of always opening at a fixed zoom."""
+        canvas = self.iface.mapCanvas()
+        extent = canvas.extent()
+        crs = QgsProject.instance().crs()
+
+        if crs.authid() != "EPSG:4326":
+            transform = QgsCoordinateTransform(crs, QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance())
+            extent = transform.transformBoundingBox(extent)
+
+        width_deg = extent.width()
+        canvas_width_px = canvas.mapSettings().outputSize().width() or 800
+
+        if width_deg <= 0:
+            return 15.0
+
+        # At zoom z, a 256px tile covers 360 degrees / 2^z of longitude.
+        zoom = math.log2(360.0 * canvas_width_px / (256.0 * width_deg))
+        return zoom
+
+    def _normalized_map_type(self):
+        # Settings combo shows "Bing Maps *" / "Apple Maps *" (the "*" just flags
+        # them as experimental); strip it so it matches the plain provider name.
+        return (self.map_type or "Google Maps").replace("*", "").strip()
+
+    def build_map_url(self, latitude, longitude):
+        zoom = self.estimate_zoom_level()
+        provider = self._normalized_map_type()
+
+        if provider == "Bing Maps":
+            return self._build_bing_url(latitude, longitude, zoom)
+        elif provider == "Apple Maps":
+            return self._build_apple_url(latitude, longitude, zoom)
         else:
-            return f"https://www.google.com/maps/@{latitude},{longitude},15z"  # Default to Google Maps
+            return self._build_google_url(latitude, longitude, zoom)  # default to Google Maps
+
+    def _build_google_url(self, latitude, longitude, zoom):
+        # https://developers.google.com/maps/documentation/urls/get-started#map-action
+        basemap = {"Roadmap": "roadmap", "Satellite": "satellite", "Terrain": "terrain"}.get(
+            self.basemap_style, "roadmap")
+        layer = {"None": "none", "Traffic": "traffic", "Transit": "transit", "Bicycling": "bicycling"}.get(
+            self.overlay_layer, "none")
+        zoom = round(max(0, min(21, zoom)))
+        return (f"https://www.google.com/maps/@?api=1&map_action=map&center={latitude},{longitude}"
+                f"&zoom={zoom}&basemap={basemap}&layer={layer}")
+
+    def _build_bing_url(self, latitude, longitude, zoom):
+        # https://learn.microsoft.com/en-us/bingmaps/articles/create-a-custom-map-url
+        # style: r=road, a=aerial (satellite), h=aerial with labels, o/b=bird's eye.
+        # Bing has no terrain style, so it falls back to road.
+        style = {"Roadmap": "r", "Satellite": "a", "Terrain": "r"}.get(self.basemap_style, "r")
+        traffic = "1" if self.overlay_layer == "Traffic" else "0"
+        zoom = round(max(1, min(20, zoom)))
+        return (f"https://bing.com/maps/default.aspx?cp={latitude}~{longitude}"
+                f"&lvl={zoom}&style={style}&trfc={traffic}")
+
+    def _build_apple_url(self, latitude, longitude, zoom):
+        # https://developer.apple.com/library/archive/featuredarticles/iPhoneURLScheme_Reference/MapLinks/MapLinks.html
+        # t: m=standard, k=satellite, h=hybrid (deprecated), r=transit view.
+        # Apple has no terrain style and no separate traffic/bicycling overlay.
+        if self.overlay_layer == "Transit":
+            map_type = "r"
+        else:
+            map_type = {"Roadmap": "m", "Satellite": "k", "Terrain": "m"}.get(self.basemap_style, "m")
+        zoom = round(max(2, min(21, zoom)))
+        return f"https://maps.apple.com/?ll={latitude},{longitude}&z={zoom}&t={map_type}"
 
     def open_google_maps_at_location(self, point=None):
         self.window = QMainWindow()
@@ -142,8 +210,8 @@ class QuickMapLinkPlugin:
 
         self.webview = QWebView()  # Use QWebView instead of QWebEngineView
 
-        latitude, longitude, extent = self.get_canvas_location(point)
-        url = self.build_map_url(latitude, longitude, extent)
+        latitude, longitude = self.get_canvas_location(point)
+        url = self.build_map_url(latitude, longitude)
 
         print(f"URL: {url}")
         self.webview.setUrl(QUrl(url))  # Create a QUrl object
@@ -159,8 +227,8 @@ class QuickMapLinkPlugin:
         # with the QGIS view finder for as long as it stays open (self.window.isVisible()).
 
     def open_google_maps_in_browser(self, point=None):
-        latitude, longitude, extent = self.get_canvas_location(point)
-        url = self.build_map_url(latitude, longitude, extent)
+        latitude, longitude = self.get_canvas_location(point)
+        url = self.build_map_url(latitude, longitude)
 
         print(f"URL: {url}")
         webbrowser.open(url)
@@ -185,17 +253,40 @@ class QuickMapLinkPlugin:
         map_type_combo.setCurrentText(self.map_type)
         layout.addWidget(map_type_combo)
 
+        # Base Map Style Selection
+        basemap_label = QLabel("Base map style:")
+        layout.addWidget(basemap_label)
+        basemap_combo = QComboBox()
+        basemap_combo.addItems(BASEMAP_OPTIONS)
+        basemap_combo.setCurrentText(self.basemap_style)
+        layout.addWidget(basemap_combo)
+
+        # Overlay Layer Selection
+        overlay_label = QLabel("Overlay layer:")
+        overlay_note = QLabel("* Not every overlay is supported by every provider.")
+        layout.addWidget(overlay_label)
+        layout.addWidget(overlay_note)
+        overlay_combo = QComboBox()
+        overlay_combo.addItems(OVERLAY_OPTIONS)
+        overlay_combo.setCurrentText(self.overlay_layer)
+        layout.addWidget(overlay_combo)
+
         # Save Button
         save_button = QPushButton("Save")
-        save_button.clicked.connect(lambda: self.save_settings(map_type_combo.currentText(), dialog))
+        save_button.clicked.connect(lambda: self.save_settings(
+            map_type_combo.currentText(), basemap_combo.currentText(), overlay_combo.currentText(), dialog))
         layout.addWidget(save_button)
 
         dialog.setLayout(layout)
         dialog.exec_()
 
-    def save_settings(self, map_type, dialog):
+    def save_settings(self, map_type, basemap_style, overlay_layer, dialog):
         self.map_type = map_type
+        self.basemap_style = basemap_style
+        self.overlay_layer = overlay_layer
         self.settings.setValue("map_type", map_type)
+        self.settings.setValue("basemap_style", basemap_style)
+        self.settings.setValue("overlay_layer", overlay_layer)
         dialog.close()
 
     def toggle_context_menu_options(self):

@@ -22,8 +22,8 @@ except ImportError:
     from qgis.PyQt.QtWebKitWidgets import QWebView as WebView  # Fallback for QGIS < 3.6 / no QtWebEngine
     USING_WEBENGINE = False
 
-from qgis.PyQt.QtWidgets import QAction, QMainWindow, QVBoxLayout, QWidget, QMenu, QDialog, QComboBox, QLabel, \
-    QPushButton, QVBoxLayout, QToolBar, QMessageBox
+from qgis.PyQt.QtWidgets import QAction, QMainWindow, QVBoxLayout, QWidget, QDialog, QComboBox, QLabel, \
+    QPushButton, QVBoxLayout, QToolBar, QCheckBox
 from qgis.core import QgsProject, QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsRectangle
 from qgis.gui import QgisInterface
 from qgis.PyQt.QtCore import Qt, QUrl, QSettings, QSize, QTimer  # Import QUrl, QSettings, QTimer from qgis.PyQt.QtCore
@@ -58,6 +58,16 @@ PROVIDER_OVERLAYS = {
     "Wikimedia Maps": ["None"],
 }
 
+# Bing: known to hard-crash QGIS in the embedded webview on some systems (see the
+# QtWebEngine GPU-crash notes below). Apple: unreliable/inconsistent when rendered in
+# an embedded Chromium view. Both are browser-only -- Webview isn't offered for them.
+PROVIDERS_WITHOUT_WEBVIEW = {"Bing Maps", "Apple Maps"}
+
+# Empirical correction: Apple Maps' "z" URL parameter renders more zoomed-out than the
+# same numeric value on Google/Bing/OSM at the shared zoom estimate, so it undershoots
+# how zoomed-in the QGIS view actually is. See _build_apple_url.
+APPLE_MAPS_ZOOM_OFFSET = 2
+
 
 def _strip_experimental_marker(map_type):
     # Settings combo shows "Bing Maps *" / "Apple Maps *" (the "*" just flags them as
@@ -68,35 +78,28 @@ def _strip_experimental_marker(map_type):
 class QuickMapLinkPlugin:
     def __init__(self, iface: QgisInterface):
         self.iface = iface
-        self.context_menu = QMenu()
-        self.context_action = QAction("Open Map Here (Webview)", self.iface.mainWindow())
-        self.context_action.triggered.connect(self.open_google_maps_context)
-        self.context_browser_action = QAction("Open Map Here (Browser)", self.iface.mainWindow())
-        self.context_browser_action.setCheckable(True)
-        self.context_browser_action.triggered.connect(self.toggle_browser_follow)
-        self.settings_action = QAction("Map Settings", self.iface.mainWindow())
+        # The one QuickMapLink action: same icon as before, used in both the toolbar
+        # and the Plugins menu, and it simply opens Map Settings. The old separate
+        # on/off toolbar toggle is gone -- that switch now lives inside the settings
+        # dialog itself (see open_settings_dialog) so there's only one icon to find.
+        self.settings_action = QAction(QIcon(":/plugins/quick_map_link/icon.png"),
+                                        "Map Settings", self.iface.mainWindow())
+        self.settings_action.setToolTip("Open Quick Map Link settings")
         self.settings_action.triggered.connect(self.open_settings_dialog)
 
-        # Load the default map type / basemap style / overlay layer from settings
+        # Load the default map type / open mode / basemap style / overlay layer / enabled
+        # state from settings
         self.settings = QSettings("MyOrganization", "QuickMapsLink Settings")
         self.map_type = self.settings.value("map_type", "Google Maps")
+        self.open_mode = self.settings.value("open_mode", "Webview")  # "Webview" or "Browser"
         self.basemap_style = self.settings.value("basemap_style", "Roadmap")
         self.overlay_layer = self.settings.value("overlay_layer", "None")
-
-        # Toolbar button
-        self.toolbar_button = QAction(QIcon(":/plugins/quick_map_link/icon.png"), "Toggle QuickMapLink", self.iface.mainWindow())
-        self.toolbar_button.setCheckable(True)
-        self.toolbar_button.setChecked(True)  # Initially checked
-        self.toolbar_button.triggered.connect(self.toggle_context_menu_options)
-
-        # Add actions to context menu
-        self.context_menu.addAction(self.context_action)
-        self.context_menu.addAction(self.context_browser_action)
+        self.context_menu_enabled = self.settings.value("context_menu_enabled", True, type=bool)
 
         # --- Live "follow the view finder" state ---
         self.window = None          # internal webview window (tracked so we know if it's open)
         self.webview = None
-        self.browser_follow_active = False  # whether "Open Map Here (Browser)" is in follow mode
+        self.browser_follow_active = False  # whether browser-follow mode is currently active
 
         # Debounce timer: coalesces rapid extentsChanged signals (e.g. while dragging the canvas)
         # so we only push an update shortly after the view finder settles.
@@ -108,23 +111,28 @@ class QuickMapLinkPlugin:
     def initGui(self):
         # Add the settings action to the plugin menu
         self.iface.addPluginToMenu("QuickMapLink", self.settings_action)
-        self.iface.mapCanvas().setContextMenuPolicy(Qt.CustomContextMenu)
-        self.iface.mapCanvas().customContextMenuRequested.connect(self.show_context_menu)
+
+        # Add our entry directly into QGIS's own native canvas right-click menu (the one
+        # that already has "Copy Coordinate" etc.), instead of showing a second, separate
+        # popup -- a second popup is what caused the "close the first menu to get to ours"
+        # behavior on macOS: the canvas already reacts to right-click on its own, and a
+        # widget-level customContextMenuRequested handler just queued a second menu after it.
+        self.iface.mapCanvas().contextMenuAboutToShow.connect(self._populate_context_menu)
 
         # Follow the QGIS view finder: fires on every pan/zoom/rotate of the canvas
         self.iface.mapCanvas().extentsChanged.connect(self._on_canvas_extents_changed)
 
-        # Add toolbar button
+        # Add the single toolbar button
         self.toolbar = self.iface.addToolBar("QuickMapLink")
-        self.toolbar.addAction(self.toolbar_button)
+        self.toolbar.addAction(self.settings_action)
 
     def unload(self):
         self.iface.removePluginMenu("QuickMapLink", self.settings_action)
-        self.iface.mapCanvas().customContextMenuRequested.disconnect(self.show_context_menu)
+        self.iface.mapCanvas().contextMenuAboutToShow.disconnect(self._populate_context_menu)
         self.iface.mapCanvas().extentsChanged.disconnect(self._on_canvas_extents_changed)
 
         # Remove toolbar button
-        self.iface.removeToolBarIcon(self.toolbar_button)
+        self.iface.removeToolBarIcon(self.settings_action)
         self.iface.mainWindow().removeToolBar(self.toolbar)
         del self.toolbar
 
@@ -153,13 +161,35 @@ class QuickMapLinkPlugin:
             # First activation: open the tab immediately at the current point, then follow
             self.open_google_maps_in_browser(getattr(self, "context_point", None))
             self.browser_follow_active = True
-            self.context_browser_action.setText("Stop Following (Browser)")
         else:
             self.browser_follow_active = False
-            self.context_browser_action.setText("Open Map Here (Browser)")
 
     def open_google_maps_context(self):
         self.open_google_maps_at_location(self.context_point)
+
+    def _populate_context_menu(self, menu, event):
+        """Add QuickMapLink's single "Open in <provider>" entry directly into QGIS's
+        own native canvas right-click menu (see initGui for why), reflecting whichever
+        provider and open-mode (Webview/Browser) are currently set in Map Settings."""
+        if not self.context_menu_enabled:
+            return  # Disabled via the checkbox in Map Settings
+
+        self.context_point = event  # has .x()/.y(), same as the QPoint it replaces
+        provider = self._normalized_map_type()
+        # Bing/Apple are browser-only regardless of the saved "Open in" setting.
+        effective_open_mode = "Browser" if provider in PROVIDERS_WITHOUT_WEBVIEW else self.open_mode
+
+        menu.addSeparator()
+        if effective_open_mode == "Browser":
+            label = f"Stop Following {provider} (Browser)" if self.browser_follow_active \
+                else f"Open in {provider} (Browser)"
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self.browser_follow_active)
+            action.triggered.connect(self.toggle_browser_follow)
+        else:
+            action = menu.addAction(f"Open in {provider} (Webview)")
+            action.triggered.connect(self.open_google_maps_context)
 
     # ------------------------------------------------------------------
     # Coordinate / URL helpers (shared by webview, browser, and follow-mode)
@@ -252,7 +282,11 @@ class QuickMapLinkPlugin:
             map_type = "r"
         else:
             map_type = {"Roadmap": "m", "Satellite": "k", "Terrain": "m"}.get(self.basemap_style, "m")
-        zoom = round(max(2, min(21, zoom)))
+        # Apple's "z" doesn't follow the same standard-slippy-map scale Google/Bing/OSM's
+        # zoom parameters do -- the same numeric value renders noticeably more zoomed-out
+        # on Apple Maps, so nudge it in to actually match the QGIS view. Empirically tuned;
+        # bump APPLE_MAPS_ZOOM_OFFSET further if it's still not zoomed in enough.
+        zoom = round(max(2, min(21, zoom + APPLE_MAPS_ZOOM_OFFSET)))
         return f"https://maps.apple.com/?ll={latitude},{longitude}&z={zoom}&t={map_type}"
 
     def _build_osm_url(self, latitude, longitude, zoom):
@@ -281,38 +315,25 @@ class QuickMapLinkPlugin:
         return f"https://maps.wikimedia.org/#{zoom}/{latitude}/{longitude}"
 
     def open_google_maps_at_location(self, point=None):
+        provider = self._normalized_map_type()
+        if provider in PROVIDERS_WITHOUT_WEBVIEW:
+            # Webview is disabled outright for these providers (Bing: known to hard-crash
+            # QGIS on some systems; Apple: unreliable in an embedded Chromium view). The
+            # settings dialog shouldn't let "Webview" be selected for them in the first
+            # place, but fall back safely here too in case of stale/legacy saved settings.
+            self.open_google_maps_in_browser(point)
+            return
+
         if not USING_WEBENGINE:
             # QtWebEngine isn't available in this QGIS build, so we're stuck with the
-            # legacy QtWebKit renderer, which is the thing known to crash on heavy
-            # sites like Bing Maps. Warn loudly rather than fail silently.
+            # legacy QtWebKit renderer, which is unmaintained and known to crash on
+            # heavy, modern map sites. Warn loudly rather than fail silently.
             print("[QuickMapLink] WARNING: QtWebEngine not found, falling back to QtWebKit's QWebView. "
-                  "This renderer is unmaintained and known to crash on modern map sites (e.g. Bing Maps). "
-                  "Consider using 'Open Map Here (Browser)' instead for those providers, or installing a "
-                  "QGIS build with QtWebEngine support.")
-
-        if self._normalized_map_type() == "Bing Maps":
-            # Bing's embedded map has been observed to hard-crash QGIS (silently, no error
-            # dialog) even under QWebEngineView -- most likely a GPU/graphics-driver crash
-            # inside the bundled Chromium engine that the software-rendering flags above
-            # don't always catch. Rather than risk losing unsaved QGIS work again, ask first.
-            choice = QMessageBox.warning(
-                self.iface.mainWindow(),
-                "Bing Maps (Webview) is unstable",
-                "The embedded Bing Maps view has been known to crash QGIS on some systems.\n\n"
-                "Open it in your default browser instead (safe), or continue in the embedded "
-                "webview anyway (risk of a crash)?",
-                QMessageBox.Open | QMessageBox.Ignore | QMessageBox.Cancel,
-                QMessageBox.Open,
-            )
-            if choice == QMessageBox.Cancel:
-                return
-            if choice == QMessageBox.Open:
-                self.open_google_maps_in_browser(point)
-                return
-            # choice == QMessageBox.Ignore: fall through and open the webview anyway
+                  "This renderer is unmaintained and may crash on some map sites. Consider switching "
+                  "'Open in' to Browser in Map Settings, or installing a QGIS build with QtWebEngine support.")
 
         self.window = QMainWindow()
-        self.window.setWindowTitle(self.map_type + " (Webview)")
+        self.window.setWindowTitle("Quick Map Link (Webview)")
         self.window.setGeometry(100, 100, 800, 600)
 
         self.webview = WebView()  # QWebEngineView when available; QWebView as a last-resort fallback
@@ -361,11 +382,6 @@ class QuickMapLinkPlugin:
         print(f"URL: {url}")
         webbrowser.open(url)
 
-    def show_context_menu(self, point):
-        self.context_point = point
-        if self.toolbar_button.isChecked():
-            self.context_menu.exec_(self.iface.mapCanvas().mapToGlobal(point))
-
     def open_settings_dialog(self):
         dialog = QDialog(self.iface.mainWindow())
         dialog.setWindowTitle("QuickMapLink Settings")
@@ -384,6 +400,13 @@ class QuickMapLinkPlugin:
         map_type_combo.setCurrentText(self.map_type)
         layout.addWidget(map_type_combo)
 
+        # Open Mode Selection -- determines what the single right-click menu entry does.
+        # Options depend on the selected provider (Bing/Apple are browser-only).
+        open_mode_label = QLabel("Open in:")
+        layout.addWidget(open_mode_label)
+        open_mode_combo = QComboBox()
+        layout.addWidget(open_mode_combo)
+
         # Base Map Style Selection (options depend on the selected provider)
         basemap_label = QLabel("Base map style:")
         layout.addWidget(basemap_label)
@@ -396,10 +419,23 @@ class QuickMapLinkPlugin:
         overlay_combo = QComboBox()
         layout.addWidget(overlay_combo)
 
-        def refresh_provider_options(preferred_basemap=None, preferred_overlay=None):
+        # Enable/disable the right-click menu entry entirely (this used to be a separate
+        # toolbar toggle; it lives here now so there's only one QuickMapLink icon).
+        enabled_checkbox = QCheckBox("Show QuickMapLink entry on the map canvas right-click menu")
+        enabled_checkbox.setChecked(self.context_menu_enabled)
+        layout.addWidget(enabled_checkbox)
+
+        def refresh_provider_options(preferred_open_mode=None, preferred_basemap=None, preferred_overlay=None):
             provider = _strip_experimental_marker(map_type_combo.currentText())
+            open_modes = ["Browser"] if provider in PROVIDERS_WITHOUT_WEBVIEW else ["Webview", "Browser"]
             basemaps = PROVIDER_BASEMAPS.get(provider, BASEMAP_OPTIONS)
             overlays = PROVIDER_OVERLAYS.get(provider, OVERLAY_OPTIONS)
+
+            open_mode_combo.blockSignals(True)
+            open_mode_combo.clear()
+            open_mode_combo.addItems(open_modes)
+            open_mode_combo.setCurrentText(preferred_open_mode if preferred_open_mode in open_modes else open_modes[0])
+            open_mode_combo.blockSignals(False)
 
             basemap_combo.blockSignals(True)
             basemap_combo.clear()
@@ -415,34 +451,35 @@ class QuickMapLinkPlugin:
 
         # Populate using the plugin's current saved choices, then re-filter (dropping
         # any selection the new provider doesn't support) whenever the provider changes.
-        refresh_provider_options(self.basemap_style, self.overlay_layer)
+        refresh_provider_options(self.open_mode, self.basemap_style, self.overlay_layer)
         map_type_combo.currentTextChanged.connect(lambda _: refresh_provider_options())
 
         # Save Button
         save_button = QPushButton("Save")
         save_button.clicked.connect(lambda: self.save_settings(
-            map_type_combo.currentText(), basemap_combo.currentText(), overlay_combo.currentText(), dialog))
+            map_type_combo.currentText(), open_mode_combo.currentText(),
+            basemap_combo.currentText(), overlay_combo.currentText(),
+            enabled_checkbox.isChecked(), dialog))
         layout.addWidget(save_button)
 
         dialog.setLayout(layout)
         dialog.exec_()
 
-    def save_settings(self, map_type, basemap_style, overlay_layer, dialog):
+    def save_settings(self, map_type, open_mode, basemap_style, overlay_layer, context_menu_enabled, dialog):
+        # Switching provider or open mode invalidates any in-progress browser-follow session.
+        self.browser_follow_active = False
+
         self.map_type = map_type
+        self.open_mode = open_mode
         self.basemap_style = basemap_style
         self.overlay_layer = overlay_layer
+        self.context_menu_enabled = context_menu_enabled
         self.settings.setValue("map_type", map_type)
+        self.settings.setValue("open_mode", open_mode)
         self.settings.setValue("basemap_style", basemap_style)
         self.settings.setValue("overlay_layer", overlay_layer)
+        self.settings.setValue("context_menu_enabled", context_menu_enabled)
         dialog.close()
-
-    def toggle_context_menu_options(self):
-        if self.toolbar_button.isChecked():
-            self.context_action.setVisible(True)
-            self.context_browser_action.setVisible(True)
-        else:
-            self.context_action.setVisible(False)
-            self.context_browser_action.setVisible(False)
 
 
 def classFactory(iface):

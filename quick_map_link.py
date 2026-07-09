@@ -26,7 +26,7 @@ from qgis.PyQt.QtWidgets import QAction, QVBoxLayout, QDialog, QComboBox, QLabel
     QPushButton, QToolBar, QCheckBox, QDockWidget, QMessageBox
 from qgis.core import QgsProject, QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsRectangle
 from qgis.gui import QgisInterface
-from qgis.PyQt.QtCore import Qt, QUrl, QSettings, QSize, QTimer  # Import QUrl, QSettings, QTimer from qgis.PyQt.QtCore
+from qgis.PyQt.QtCore import Qt, QUrl, QSettings, QSize, QTimer, QObject, QEvent  # Import QUrl, QSettings, QTimer from qgis.PyQt.QtCore
 from qgis.PyQt.QtGui import QIcon
 import webbrowser
 import math
@@ -98,6 +98,21 @@ def _webview_disabled(provider):
     return False
 
 
+class _DockGeometryWatcher(QObject):
+    """Relays Move/Resize events on the webview dock back to a save callback.
+    QDockWidget doesn't expose signals for these, so an event filter is the standard
+    Qt way to observe them -- and the filter target must be a QObject, which the
+    plugin class itself isn't, hence this small standalone helper."""
+    def __init__(self, save_callback, parent=None):
+        super().__init__(parent)
+        self._save_callback = save_callback
+
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.Move, QEvent.Resize):
+            self._save_callback()
+        return False
+
+
 class QuickMapLinkPlugin:
     def __init__(self, iface: QgisInterface):
         self.iface = iface
@@ -122,6 +137,7 @@ class QuickMapLinkPlugin:
         # --- Live "follow the view finder" state ---
         self.window = None          # internal webview window (tracked so we know if it's open)
         self.webview = None
+        self._dock_geometry_watcher = None  # watches self.window for move/resize, see _save_webview_dock_state
         self.browser_follow_active = False  # whether browser-follow mode is currently active
         self._last_browser_location = None  # (lat, lon) last actually opened, for the move-threshold check
 
@@ -164,6 +180,7 @@ class QuickMapLinkPlugin:
         self.iface.mapCanvas().extentsChanged.disconnect(self._on_canvas_extents_changed)
 
         if self.window is not None:
+            self._save_webview_dock_state()
             self.iface.removeDockWidget(self.window)
             self.window = None
             self.webview = None
@@ -172,6 +189,18 @@ class QuickMapLinkPlugin:
         self.iface.removeToolBarIcon(self.settings_action)
         self.iface.mainWindow().removeToolBar(self.toolbar)
         del self.toolbar
+
+    # ------------------------------------------------------------------
+    # Webview dock persistence: remember where it was left (docked to which
+    # side, or floating, and at what size/position) across QGIS restarts.
+    # ------------------------------------------------------------------
+    def _save_webview_dock_state(self, *_args):
+        if self.window is None:
+            return
+        self.settings.setValue("webview/floating", self.window.isFloating())
+        self.settings.setValue(
+            "webview/dock_area", int(self.iface.mainWindow().dockWidgetArea(self.window)))
+        self.settings.setValue("webview/geometry", self.window.saveGeometry())
 
     # ------------------------------------------------------------------
     # Live-follow: react to the QGIS view finder moving
@@ -410,10 +439,9 @@ class QuickMapLinkPlugin:
         if self.window is None:
             # A QDockWidget instead of a plain floating window: it can be dragged to
             # any edge of the QGIS window and docked there, or dragged back out to
-            # float, the same way QGIS's own Layers/Browser panels work. It starts
-            # floating (like the old window did) but the user can pin it wherever
-            # they like. Created once and reused on later opens, rather than piling
-            # up a new window every time "Open in Webview" is used.
+            # float, the same way QGIS's own Layers/Browser panels work. Created once
+            # and reused on later opens, rather than piling up a new window every time
+            # "Open in Webview" is used.
             self.window = QDockWidget("Quick Map Link (Webview)", self.iface.mainWindow())
             self.window.setObjectName("QuickMapLinkWebviewDock")  # lets QGIS remember its position
             self.window.setFeatures(QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable
@@ -426,9 +454,31 @@ class QuickMapLinkPlugin:
                 pass
             self.window.setWidget(self.webview)
 
-            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.window)
-            self.window.setFloating(True)
-            self.window.resize(800, 600)
+            # Restore whichever dock area, floating state, and size/position the webview
+            # was left in last time (falls back to floating on the right, 800x600, the
+            # first time it's ever opened / if nothing's been saved yet).
+            saved_area = int(self.settings.value("webview/dock_area", Qt.RightDockWidgetArea))
+            self.iface.addDockWidget(Qt.DockWidgetArea(saved_area), self.window)
+
+            was_floating = self.settings.value("webview/floating", True, type=bool)
+            self.window.setFloating(was_floating)
+
+            saved_geometry = self.settings.value("webview/geometry")
+            if saved_geometry is not None:
+                self.window.restoreGeometry(saved_geometry)
+            elif was_floating:
+                self.window.resize(800, 600)
+
+            # Persist the dock area / floating state as the user redocks or pops it back
+            # out, and geometry whenever it moves or resizes, so it reopens the same way
+            # next time -- including across QGIS restarts (unlike QGIS's own automatic
+            # window-state restore, which only covers dock widgets that already exist at
+            # startup, not ones a plugin creates lazily on first use).
+            self.window.dockLocationChanged.connect(self._save_webview_dock_state)
+            self.window.topLevelChanged.connect(self._save_webview_dock_state)
+            self._dock_geometry_watcher = _DockGeometryWatcher(
+                self._save_webview_dock_state, self.window)
+            self.window.installEventFilter(self._dock_geometry_watcher)
 
         # Show the dock (giving the webview its final size) BEFORE loading the URL.
         # Leaflet-based sites (OSM, OpenTopoMap, Wikimedia Maps) measure their container

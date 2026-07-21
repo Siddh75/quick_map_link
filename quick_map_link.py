@@ -18,63 +18,36 @@ os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 try:
     from qgis.PyQt.QtWebEngineWidgets import QWebEngineView as WebView
     USING_WEBENGINE = True
+    HAS_WEBVIEW = True
 except ImportError:
-    from qgis.PyQt.QtWebKitWidgets import QWebView as WebView  # Fallback for QGIS < 3.6 / no QtWebEngine
-    USING_WEBENGINE = False
+    try:
+        # Legacy fallback for old Qt5-based QGIS builds compiled without QtWebEngine.
+        # QtWebKitWidgets does not exist at all under Qt6 (Qt dropped WebKit outright),
+        # so this raises ImportError there too -- caught below rather than left to crash
+        # plugin load entirely.
+        from qgis.PyQt.QtWebKitWidgets import QWebView as WebView
+        USING_WEBENGINE = False
+        HAS_WEBVIEW = True
+    except ImportError:
+        # Neither renderer is available on this QGIS build (most commonly a Qt6 build,
+        # which has no QtWebKit and may not always ship QtWebEngine either). Degrade to
+        # Browser-only mode everywhere a webview would otherwise be used -- see
+        # _webview_disabled -- rather than crashing the whole plugin on import.
+        WebView = None
+        USING_WEBENGINE = False
+        HAS_WEBVIEW = False
 
 from qgis.PyQt.QtWidgets import QAction, QVBoxLayout, QDialog, QComboBox, QLabel, \
-    QPushButton, QToolBar, QCheckBox, QDockWidget, QMessageBox
-from qgis.core import QgsProject, QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsRectangle
-from qgis.gui import QgisInterface
-from qgis.PyQt.QtCore import Qt, QUrl, QSettings, QSize, QTimer, QObject, QEvent  # Import QUrl, QSettings, QTimer from qgis.PyQt.QtCore
-from qgis.PyQt.QtGui import QIcon
+    QPushButton, QCheckBox, QDockWidget, QMessageBox, QWidget
+from qgis.core import QgsProject
+from qgis.gui import QgisInterface, QgsMapCanvas
+from qgis.PyQt.QtCore import Qt, QUrl, QSettings, QTimer, QObject, QEvent, QPoint
+from qgis.PyQt.QtGui import QIcon, QPainter, QColor, QPen
 import webbrowser
-import math
 
-from .resources import *
+from . import sources
 
-# Full superset of options, used as a fallback for any provider not listed below.
-BASEMAP_OPTIONS = ["Roadmap", "Satellite", "Terrain"]
-OVERLAY_OPTIONS = ["None", "Traffic", "Transit", "Bicycling"]
-
-# What each provider actually supports -- the settings dialog filters its "Base map
-# style" and "Overlay layer" dropdowns to these lists based on the selected provider,
-# instead of always showing options that don't apply (e.g. "Terrain" for Bing, or any
-# basemap switch at all for the single-style OSM-based providers).
-PROVIDER_BASEMAPS = {
-    "Google Maps": ["Roadmap", "Satellite", "Terrain"],
-    "Bing Maps": ["Roadmap", "Satellite"],
-    "Apple Maps": ["Roadmap", "Satellite"],
-    "OpenStreetMap": ["Standard"],
-    "OpenTopoMap": ["Topographic"],
-    "Wikimedia Maps": ["Standard"],
-}
-PROVIDER_OVERLAYS = {
-    "Google Maps": ["None", "Traffic", "Transit", "Bicycling"],
-    "Bing Maps": ["None", "Traffic"],
-    "Apple Maps": ["None", "Transit"],
-    "OpenStreetMap": ["None", "Transit", "Bicycling"],
-    "OpenTopoMap": ["None"],
-    "Wikimedia Maps": ["None"],
-}
-
-# Bing: known to hard-crash QGIS in the embedded webview on some systems (see the
-# QtWebEngine GPU-crash notes below). Apple: unreliable/inconsistent when rendered in
-# an embedded Chromium view. Both are browser-only -- Webview isn't offered for them.
-PROVIDERS_WITHOUT_WEBVIEW = {"Bing Maps", "Apple Maps"}
-
-# Providers confirmed broken specifically under the legacy QtWebKit fallback (i.e. only
-# when QtWebEngine isn't available at all) -- their JS bundle uses syntax that engine's
-# frozen JS parser can't handle. OSM confirmed via JS console forwarding: a SyntaxError
-# on object-spread syntax ('...') in its main bundle. Google Maps, OpenTopoMap, and
-# Wikimedia Maps have all been confirmed to render fine on the same QtWebKit fallback,
-# so this is deliberately narrow rather than disabling Webview for everything.
-PROVIDERS_BROKEN_ON_WEBKIT = {"OpenStreetMap"}
-
-# Empirical correction: Apple Maps' "z" URL parameter renders more zoomed-out than the
-# same numeric value on Google/Bing/OSM at the shared zoom estimate, so it undershoots
-# how zoomed-in the QGIS view actually is. See _build_apple_url.
-APPLE_MAPS_ZOOM_OFFSET = 2
+ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
 
 # Browser-follow can't update an already-open tab in place (webbrowser.open() always
 # risks a new tab), so it's throttled much harder than the webview: a long debounce
@@ -83,17 +56,15 @@ APPLE_MAPS_ZOOM_OFFSET = 2
 BROWSER_FOLLOW_DEBOUNCE_MS = 1000
 
 
-def _strip_experimental_marker(map_type):
-    # Settings combo shows "Bing Maps *" / "Apple Maps *" (the "*" just flags them as
-    # experimental); strip it so it matches the plain provider name used everywhere else.
-    return (map_type or "Google Maps").replace("*", "").strip()
-
-
 def _webview_disabled(provider):
-    """True if Webview mode shouldn't be offered for this provider at all."""
-    if provider in PROVIDERS_WITHOUT_WEBVIEW:
+    """True if Webview mode shouldn't be offered for this provider at all. Only
+    meaningful for web map providers -- tile basemaps (sources.is_tile_basemap)
+    are handled separately since Browser mode never applies to them at all."""
+    if not HAS_WEBVIEW:
         return True
-    if not USING_WEBENGINE and provider in PROVIDERS_BROKEN_ON_WEBKIT:
+    if provider in sources.PROVIDERS_WITHOUT_WEBVIEW:
+        return True
+    if not USING_WEBENGINE and provider in sources.PROVIDERS_BROKEN_ON_WEBKIT:
         return True
     return False
 
@@ -113,6 +84,44 @@ class _DockGeometryWatcher(QObject):
         return False
 
 
+class _CursorOverlay(QWidget):
+    """A small crosshair drawn on top of the webview, repositioned to track where
+    the QGIS canvas mouse cursor currently maps to on the embedded web map.
+
+    This is a Qt-side overlay widget only -- it doesn't (and can't) reach into the
+    third-party map page's own DOM/JS, since we're just loading Google Maps/OSM/etc.
+    as a plain page, not driving them via their JS APIs. Its position is computed
+    from standard web-mercator math against whatever center/zoom the plugin last
+    set on the page (see QuickMapLinkPlugin._webview_map_center/_webview_map_zoom),
+    so it stays accurate as long as that's still what's actually displayed -- if the
+    user manually pans/zooms the embedded map themselves, this will drift out of
+    sync until the next refresh (e.g. the next live-follow update)."""
+    _SIZE = 18
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setFixedSize(self._SIZE, self._SIZE)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)  # clicks/drags pass through to the map
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.hide()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        center = self._SIZE // 2
+        radius = 5
+
+        pen = QPen(QColor(255, 0, 0, 230))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.setBrush(QColor(255, 0, 0, 60))
+        painter.drawEllipse(QPoint(center, center), radius, radius)
+        painter.drawLine(center - 8, center, center - radius - 1, center)
+        painter.drawLine(center + radius + 1, center, center + 8, center)
+        painter.drawLine(center, center - 8, center, center - radius - 1)
+        painter.drawLine(center, center + radius + 1, center, center + 8)
+
+
 class QuickMapLinkPlugin:
     def __init__(self, iface: QgisInterface):
         self.iface = iface
@@ -120,7 +129,7 @@ class QuickMapLinkPlugin:
         # and the Plugins menu, and it simply opens Map Settings. The old separate
         # on/off toolbar toggle is gone -- that switch now lives inside the settings
         # dialog itself (see open_settings_dialog) so there's only one icon to find.
-        self.settings_action = QAction(QIcon(":/plugins/quick_map_link/icon.png"),
+        self.settings_action = QAction(QIcon(ICON_PATH),
                                         "QuickMapLink", self.iface.mainWindow())
         self.settings_action.setToolTip("Open Quick Map Link settings")
         self.settings_action.triggered.connect(self.open_settings_dialog)
@@ -135,11 +144,22 @@ class QuickMapLinkPlugin:
         self.context_menu_enabled = self.settings.value("context_menu_enabled", True, type=bool)
 
         # --- Live "follow the view finder" state ---
-        self.window = None          # internal webview window (tracked so we know if it's open)
-        self.webview = None
+        self.window = None          # internal dock widget (tracked so we know if it's open)
+        self.webview = None         # WebView instance, when the dock is showing a web map provider
+        self.map_canvas = None      # QgsMapCanvas instance, when the dock is showing a tile basemap
+        self._tile_layer = None     # QgsRasterLayer currently shown in map_canvas -- kept alive here since
+                                     # setLayers() doesn't itself hold a Python reference; without this the
+                                     # layer gets garbage-collected right after this method returns, leaving
+                                     # the canvas pointing at a dead layer (renders blank, no error anywhere)
+        self._content_kind = None   # "provider" or "tile" -- whichever of the above is currently installed
         self._dock_geometry_watcher = None  # watches self.window for move/resize, see _save_webview_dock_state
         self.browser_follow_active = False  # whether browser-follow mode is currently active
         self._last_browser_location = None  # (lat, lon) last actually opened, for the move-threshold check
+
+        # --- Webview mouse-cursor overlay state ---
+        self._cursor_overlay = None       # the _CursorOverlay widget, created alongside the webview
+        self._webview_map_center = None   # (lat, lon) last set as the webview's URL center
+        self._webview_map_zoom = None     # integer zoom last used for that URL
 
         # Webview follow: short debounce, coalesces rapid extentsChanged signals (e.g.
         # while dragging the canvas) so we only push an update shortly after settling.
@@ -170,6 +190,11 @@ class QuickMapLinkPlugin:
         # Follow the QGIS view finder: fires on every pan/zoom/rotate of the canvas
         self.iface.mapCanvas().extentsChanged.connect(self._on_canvas_extents_changed)
 
+        # Mirror the canvas mouse position onto the webview (see _on_canvas_mouse_moved).
+        # xyCoordinates already gives us the position in map (project) coordinates, same
+        # signal QGIS's own status bar coordinate display uses.
+        self.iface.mapCanvas().xyCoordinates.connect(self._on_canvas_mouse_moved)
+
         # Add the single toolbar button
         self.toolbar = self.iface.addToolBar("QuickMapLink")
         self.toolbar.addAction(self.settings_action)
@@ -178,12 +203,17 @@ class QuickMapLinkPlugin:
         self.iface.pluginMenu().removeAction(self.settings_action)
         self.iface.mapCanvas().contextMenuAboutToShow.disconnect(self._populate_context_menu)
         self.iface.mapCanvas().extentsChanged.disconnect(self._on_canvas_extents_changed)
+        self.iface.mapCanvas().xyCoordinates.disconnect(self._on_canvas_mouse_moved)
 
         if self.window is not None:
             self._save_webview_dock_state()
             self.iface.removeDockWidget(self.window)
             self.window = None
             self.webview = None
+            self.map_canvas = None
+            self._tile_layer = None
+            self._content_kind = None
+            self._cursor_overlay = None
 
         # Remove toolbar button
         self.iface.removeToolBarIcon(self.settings_action)
@@ -217,8 +247,14 @@ class QuickMapLinkPlugin:
     def _on_webview_follow_settled(self):
         if self.window is None or not self.window.isVisible():
             return
+        if self._content_kind == "tile":
+            # No lat/lon/zoom URL involved -- just mirror the QGIS canvas extent
+            # directly onto the native tile-basemap canvas, same coordinate space.
+            self._refresh_tile_canvas()
+            return
         latitude, longitude = self.get_canvas_location()
         url = self.build_map_url(latitude, longitude)
+        self._remember_webview_map_view(latitude, longitude)
         self.webview.setUrl(QUrl(url))
 
     def _on_browser_follow_settled(self):
@@ -291,7 +327,8 @@ class QuickMapLinkPlugin:
             follow_action.setChecked(self.browser_follow_active)
             follow_action.triggered.connect(self.toggle_browser_follow)
         else:
-            action = menu.addAction(f"Open in {provider} (Webview)")
+            label = f"Open in {provider}" if sources.is_tile_basemap(provider) else f"Open in {provider} (Webview)"
+            action = menu.addAction(label)
             action.triggered.connect(self.open_google_maps_context)
 
     # ------------------------------------------------------------------
@@ -300,126 +337,52 @@ class QuickMapLinkPlugin:
     def get_canvas_location(self, point=None):
         """Return (latitude, longitude) in WGS84 for a given canvas-widget
         pixel point, or for the current canvas center if no point is given."""
-        extent = self.iface.mapCanvas().extent()
-
         if point:
             map_point = self.iface.mapCanvas().getCoordinateTransform().toMapCoordinates(point.x(), point.y())
         else:
-            map_point = extent.center()
+            map_point = self.iface.mapCanvas().extent().center()
 
-        # Transform the point to WGS 84 (EPSG:4326) if needed
-        crs = QgsProject.instance().crs()
-        if crs.authid() != "EPSG:4326":
-            transform = QgsCoordinateTransform(crs, QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance())
-            map_point = transform.transform(map_point)
+        return self._map_point_to_wgs84(map_point)
 
-        return map_point.y(), map_point.x()
+    def _map_point_to_wgs84(self, map_point):
+        """Transform a QgsPointXY already in map (project) coordinates to
+        (latitude, longitude) in WGS84 -- shared by get_canvas_location (pixel-based)
+        and _on_canvas_mouse_moved (already map-coordinate-based, via xyCoordinates)."""
+        return sources.map_point_to_wgs84(map_point, QgsProject.instance().crs())
 
     def estimate_zoom_level(self):
         """Approximate a web-mercator zoom level that matches how zoomed-in the
         current QGIS canvas view is, so the opened map roughly matches what's
         visible in QGIS instead of always opening at a fixed zoom."""
-        canvas = self.iface.mapCanvas()
-        extent = canvas.extent()
-        crs = QgsProject.instance().crs()
-
-        if crs.authid() != "EPSG:4326":
-            transform = QgsCoordinateTransform(crs, QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance())
-            extent = transform.transformBoundingBox(extent)
-
-        width_deg = extent.width()
-        canvas_width_px = canvas.mapSettings().outputSize().width() or 800
-
-        if width_deg <= 0:
-            return 15.0
-
-        # At zoom z, a 256px tile covers 360 degrees / 2^z of longitude.
-        zoom = math.log2(360.0 * canvas_width_px / (256.0 * width_deg))
-        return zoom
+        return sources.estimate_zoom_level(self.iface.mapCanvas())
 
     def _normalized_map_type(self):
-        return _strip_experimental_marker(self.map_type)
+        return sources.strip_experimental_marker(self.map_type)
 
     def build_map_url(self, latitude, longitude):
         zoom = self.estimate_zoom_level()
         provider = self._normalized_map_type()
-
-        if provider == "Bing Maps":
-            return self._build_bing_url(latitude, longitude, zoom)
-        elif provider == "Apple Maps":
-            return self._build_apple_url(latitude, longitude, zoom)
-        elif provider == "OpenStreetMap":
-            return self._build_osm_url(latitude, longitude, zoom)
-        elif provider == "OpenTopoMap":
-            return self._build_opentopomap_url(latitude, longitude, zoom)
-        elif provider == "Wikimedia Maps":
-            return self._build_wikimedia_url(latitude, longitude, zoom)
-        else:
-            return self._build_google_url(latitude, longitude, zoom)  # default to Google Maps
-
-    def _build_google_url(self, latitude, longitude, zoom):
-        # https://developers.google.com/maps/documentation/urls/get-started#map-action
-        basemap = {"Roadmap": "roadmap", "Satellite": "satellite", "Terrain": "terrain"}.get(
-            self.basemap_style, "roadmap")
-        layer = {"None": "none", "Traffic": "traffic", "Transit": "transit", "Bicycling": "bicycling"}.get(
-            self.overlay_layer, "none")
-        zoom = round(max(0, min(21, zoom)))
-        return (f"https://www.google.com/maps/@?api=1&map_action=map&center={latitude},{longitude}"
-                f"&zoom={zoom}&basemap={basemap}&layer={layer}")
-
-    def _build_bing_url(self, latitude, longitude, zoom):
-        # https://learn.microsoft.com/en-us/bingmaps/articles/create-a-custom-map-url
-        # style: r=road, a=aerial (satellite), h=aerial with labels, o/b=bird's eye.
-        # Bing has no terrain style, so it falls back to road.
-        style = {"Roadmap": "r", "Satellite": "a", "Terrain": "r"}.get(self.basemap_style, "r")
-        traffic = "1" if self.overlay_layer == "Traffic" else "0"
-        zoom = round(max(1, min(20, zoom)))
-        return (f"https://bing.com/maps/default.aspx?cp={latitude}~{longitude}"
-                f"&lvl={zoom}&style={style}&trfc={traffic}")
-
-    def _build_apple_url(self, latitude, longitude, zoom):
-        # https://developer.apple.com/library/archive/featuredarticles/iPhoneURLScheme_Reference/MapLinks/MapLinks.html
-        # t: m=standard, k=satellite, h=hybrid (deprecated), r=transit view.
-        # Apple has no terrain style and no separate traffic/bicycling overlay.
-        if self.overlay_layer == "Transit":
-            map_type = "r"
-        else:
-            map_type = {"Roadmap": "m", "Satellite": "k", "Terrain": "m"}.get(self.basemap_style, "m")
-        # Apple's "z" doesn't follow the same standard-slippy-map scale Google/Bing/OSM's
-        # zoom parameters do -- the same numeric value renders noticeably more zoomed-out
-        # on Apple Maps, so nudge it in to actually match the QGIS view. Empirically tuned;
-        # bump APPLE_MAPS_ZOOM_OFFSET further if it's still not zoomed in enough.
-        zoom = round(max(2, min(21, zoom + APPLE_MAPS_ZOOM_OFFSET)))
-        return f"https://maps.apple.com/?ll={latitude},{longitude}&z={zoom}&t={map_type}"
-
-    def _build_osm_url(self, latitude, longitude, zoom):
-        # https://wiki.openstreetmap.org/wiki/Browsing
-        # Single default render (Mapnik); the only real "layer" switch available is
-        # &layers=C (CyclOSM) or &layers=H (Humanitarian). Basemap style (satellite/
-        # terrain) doesn't apply -- OSM only has the one road-map style.
-        zoom = round(max(0, min(19, zoom)))
-        url = f"https://www.openstreetmap.org/?mlat={latitude}&mlon={longitude}#map={zoom}/{latitude}/{longitude}"
-        if self.overlay_layer == "Bicycling":
-            url += "&layers=C"
-        elif self.overlay_layer == "Transit":
-            url += "&layers=H"  # closest available match: Humanitarian OSM Team style
-        return url
-
-    def _build_opentopomap_url(self, latitude, longitude, zoom):
-        # https://opentopomap.org -- single topographic/contour style, no basemap or
-        # overlay options to switch (no satellite/traffic/transit equivalents).
-        zoom = round(max(0, min(17, zoom)))  # OpenTopoMap tiles top out around z17
-        return f"https://opentopomap.org/#map={zoom}/{latitude}/{longitude}"
-
-    def _build_wikimedia_url(self, latitude, longitude, zoom):
-        # https://maps.wikimedia.org -- single default OSM-based style, no basemap or
-        # overlay switches in the URL.
-        zoom = round(max(0, min(18, zoom)))
-        return f"https://maps.wikimedia.org/#{zoom}/{latitude}/{longitude}"
+        return sources.build_provider_url(
+            provider, self.basemap_style, self.overlay_layer, latitude, longitude, zoom)
 
     def open_google_maps_at_location(self, point=None):
         provider = self._normalized_map_type()
-        if provider in PROVIDERS_WITHOUT_WEBVIEW:
+
+        if sources.is_tile_basemap(provider):
+            # Tile basemaps render natively (QgsMapCanvas), not through a webview or
+            # browser at all -- see _open_tile_basemap.
+            self._open_tile_basemap(provider)
+            return
+
+        if not HAS_WEBVIEW:
+            # This QGIS build has no usable embedded-webview renderer at all (neither
+            # QtWebEngine nor the legacy QtWebKit -- typically a Qt6 build). Every web
+            # provider falls back to the system browser; tile basemaps above are
+            # unaffected since they never touch WebView at all.
+            self.open_google_maps_in_browser(point)
+            return
+
+        if provider in sources.PROVIDERS_WITHOUT_WEBVIEW:
             # Webview is disabled outright for these providers (Bing: known to hard-crash
             # QGIS on some systems; Apple: unreliable in an embedded Chromium view). The
             # settings dialog shouldn't let "Webview" be selected for them in the first
@@ -427,7 +390,7 @@ class QuickMapLinkPlugin:
             self.open_google_maps_in_browser(point)
             return
 
-        if not USING_WEBENGINE and provider in PROVIDERS_BROKEN_ON_WEBKIT:
+        if not USING_WEBENGINE and provider in sources.PROVIDERS_BROKEN_ON_WEBKIT:
             # Confirmed via JS console forwarding: this provider's bundle uses syntax
             # (e.g. OSM's object-spread) that QtWebKit's frozen JS engine can't parse --
             # the page loads but silently fails to render anything. Google Maps,
@@ -436,49 +399,9 @@ class QuickMapLinkPlugin:
             self.open_google_maps_in_browser(point)
             return
 
-        if self.window is None:
-            # A QDockWidget instead of a plain floating window: it can be dragged to
-            # any edge of the QGIS window and docked there, or dragged back out to
-            # float, the same way QGIS's own Layers/Browser panels work. Created once
-            # and reused on later opens, rather than piling up a new window every time
-            # "Open in Webview" is used.
-            self.window = QDockWidget("Quick Map Link (Webview)", self.iface.mainWindow())
-            self.window.setObjectName("QuickMapLinkWebviewDock")  # lets QGIS remember its position
-            self.window.setFeatures(QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable
-                                     | QDockWidget.DockWidgetFloatable)
-
-            self.webview = WebView()  # QWebEngineView when available; QWebView as a last-resort fallback
-            try:
-                self.webview.loadFinished.connect(self._on_webview_load_finished)
-            except AttributeError:
-                pass
-            self.window.setWidget(self.webview)
-
-            # Restore whichever dock area, floating state, and size/position the webview
-            # was left in last time (falls back to floating on the right, 800x600, the
-            # first time it's ever opened / if nothing's been saved yet).
-            saved_area = int(self.settings.value("webview/dock_area", Qt.RightDockWidgetArea))
-            self.iface.addDockWidget(Qt.DockWidgetArea(saved_area), self.window)
-
-            was_floating = self.settings.value("webview/floating", True, type=bool)
-            self.window.setFloating(was_floating)
-
-            saved_geometry = self.settings.value("webview/geometry")
-            if saved_geometry is not None:
-                self.window.restoreGeometry(saved_geometry)
-            elif was_floating:
-                self.window.resize(800, 600)
-
-            # Persist the dock area / floating state as the user redocks or pops it back
-            # out, and geometry whenever it moves or resizes, so it reopens the same way
-            # next time -- including across QGIS restarts (unlike QGIS's own automatic
-            # window-state restore, which only covers dock widgets that already exist at
-            # startup, not ones a plugin creates lazily on first use).
-            self.window.dockLocationChanged.connect(self._save_webview_dock_state)
-            self.window.topLevelChanged.connect(self._save_webview_dock_state)
-            self._dock_geometry_watcher = _DockGeometryWatcher(
-                self._save_webview_dock_state, self.window)
-            self.window.installEventFilter(self._dock_geometry_watcher)
+        self._ensure_dock()
+        self._ensure_provider_webview()
+        self.window.setWindowTitle(f"Quick Map Link — {provider} (Webview)")
 
         # Show the dock (giving the webview its final size) BEFORE loading the URL.
         # Leaflet-based sites (OSM, OpenTopoMap, Wikimedia Maps) measure their container
@@ -490,10 +413,143 @@ class QuickMapLinkPlugin:
 
         latitude, longitude = self.get_canvas_location(point)
         url = self.build_map_url(latitude, longitude)
+        self._remember_webview_map_view(latitude, longitude)
 
         self.webview.setUrl(QUrl(url))  # Create a QUrl object
         # From here on, _on_canvas_extents_changed will keep this dock in sync
         # with the QGIS view finder for as long as it stays open (self.window.isVisible()).
+
+    def _open_tile_basemap(self, name):
+        self._ensure_dock()
+        self._ensure_tile_canvas()
+        self.window.setWindowTitle(f"Quick Map Link — {name}")
+
+        self.window.show()
+        self.window.raise_()
+        self._refresh_tile_canvas(name)
+
+    def _refresh_tile_canvas(self, name=None):
+        if self.map_canvas is None:
+            return
+        name = name or self._normalized_map_type()
+        available_styles = sources.basemap_styles(name)
+        style = self.basemap_style if self.basemap_style in available_styles else None
+        layer = sources.make_xyz_raster_layer(name, style)
+        if layer is None or not layer.isValid():
+            return
+        # Keep a reference on self -- setLayers() does not itself keep the Python
+        # wrapper alive, so without this the layer can be garbage-collected right
+        # after this call, leaving the canvas pointing at a dead layer (blank,
+        # silent -- no error surfaces anywhere).
+        self._tile_layer = layer
+        self.map_canvas.setLayers([layer])
+        self.map_canvas.setExtent(self.iface.mapCanvas().extent())
+        self.map_canvas.refresh()
+
+    # ------------------------------------------------------------------
+    # Dock/content management: the single dock widget can hold either a WebView
+    # (web map provider) or a QgsMapCanvas (tile basemap) as its content, swapped
+    # out as needed if the user switches between the two kinds of source -- see
+    # _ensure_provider_webview / _ensure_tile_canvas.
+    # ------------------------------------------------------------------
+    def _ensure_dock(self):
+        """Create the dock widget shell itself (position/size persistence included)
+        if it doesn't exist yet. Its content is managed separately, since it can
+        change between a WebView and a QgsMapCanvas depending on the selected source."""
+        if self.window is not None:
+            return
+
+        # A QDockWidget instead of a plain floating window: it can be dragged to
+        # any edge of the QGIS window and docked there, or dragged back out to
+        # float, the same way QGIS's own Layers/Browser panels work. Created once
+        # and reused on later opens, rather than piling up a new window every time
+        # "Open in Webview" is used.
+        self.window = QDockWidget("Quick Map Link", self.iface.mainWindow())
+        self.window.setObjectName("QuickMapLinkWebviewDock")  # lets QGIS remember its position
+        self.window.setFeatures(QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable
+                                 | QDockWidget.DockWidgetFloatable)
+
+        # Restore whichever dock area, floating state, and size/position the dock
+        # was left in last time (falls back to floating on the right, 800x600, the
+        # first time it's ever opened / if nothing's been saved yet).
+        saved_area = int(self.settings.value("webview/dock_area", Qt.RightDockWidgetArea))
+        self.iface.addDockWidget(Qt.DockWidgetArea(saved_area), self.window)
+
+        was_floating = self.settings.value("webview/floating", True, type=bool)
+        self.window.setFloating(was_floating)
+
+        saved_geometry = self.settings.value("webview/geometry")
+        if saved_geometry is not None:
+            self.window.restoreGeometry(saved_geometry)
+        elif was_floating:
+            self.window.resize(800, 600)
+
+        # Persist the dock area / floating state as the user redocks or pops it back
+        # out, and geometry whenever it moves or resizes, so it reopens the same way
+        # next time -- including across QGIS restarts (unlike QGIS's own automatic
+        # window-state restore, which only covers dock widgets that already exist at
+        # startup, not ones a plugin creates lazily on first use).
+        self.window.dockLocationChanged.connect(self._save_webview_dock_state)
+        self.window.topLevelChanged.connect(self._save_webview_dock_state)
+        self._dock_geometry_watcher = _DockGeometryWatcher(
+            self._save_webview_dock_state, self.window)
+        self.window.installEventFilter(self._dock_geometry_watcher)
+
+    def _teardown_dock_content(self):
+        """Remove whatever's currently installed in the dock (WebView or
+        QgsMapCanvas) so a new one of a possibly-different kind can take its place."""
+        if self.window is not None:
+            self.window.setWidget(None)
+        if self.webview is not None:
+            self.webview.deleteLater()
+            self.webview = None
+        if self.map_canvas is not None:
+            self.map_canvas.deleteLater()
+            self.map_canvas = None
+        self._tile_layer = None
+        self._cursor_overlay = None
+        self._content_kind = None
+
+    def _ensure_provider_webview(self):
+        """Make sure a WebView is installed in the dock, tearing down a tile-basemap
+        canvas first if that's what's currently there."""
+        if self._content_kind == "provider" and self.webview is not None:
+            return
+        self._teardown_dock_content()
+
+        self.webview = WebView()  # QWebEngineView when available; QWebView as a last-resort fallback
+        try:
+            self.webview.loadFinished.connect(self._on_webview_load_finished)
+        except AttributeError:
+            pass
+        self.window.setWidget(self.webview)
+
+        # Floating crosshair that tracks the QGIS canvas mouse position onto the
+        # embedded map (see _CursorOverlay and _on_canvas_mouse_moved). Tile
+        # basemaps get their own copy of this in _ensure_tile_canvas.
+        self._cursor_overlay = _CursorOverlay(self.webview)
+        self._content_kind = "provider"
+
+
+    def _ensure_tile_canvas(self):
+        """Make sure a QgsMapCanvas is installed in the dock, tearing down a
+        WebView first if that's what's currently there."""
+        if self._content_kind == "tile" and self.map_canvas is not None:
+            return
+        self._teardown_dock_content()
+
+        canvas = QgsMapCanvas()
+        canvas.setCanvasColor(Qt.white)
+        canvas.enableAntiAliasing(True)
+        canvas.setDestinationCrs(QgsProject.instance().crs())
+        self.map_canvas = canvas
+        self.window.setWidget(self.map_canvas)
+
+        # Same crosshair widget as the webview case, just parented to the map
+        # canvas instead -- see _update_tile_cursor_overlay for why this one can
+        # be positioned exactly rather than estimated.
+        self._cursor_overlay = _CursorOverlay(self.map_canvas)
+        self._content_kind = "tile"
 
     def _on_webview_load_finished(self, ok):
         self._nudge_map_resize(ok)
@@ -516,6 +572,83 @@ class QuickMapLinkPlugin:
 
         webbrowser.open(url)
 
+    # ------------------------------------------------------------------
+    # Webview mouse-cursor overlay: mirror the QGIS canvas mouse position onto
+    # the embedded map. See _CursorOverlay for why this is Qt-side math against
+    # a remembered center/zoom rather than anything driven by the page itself.
+    # ------------------------------------------------------------------
+    def _remember_webview_map_view(self, latitude, longitude):
+        """Record the center/zoom just used to build the webview's URL, so the
+        cursor overlay can work out where later mouse positions fall relative to
+        it. Zoom is rounded/clamped the same way build_map_url's per-provider
+        builders do, so it matches what's actually rendered closely enough."""
+        self._webview_map_center = (latitude, longitude)
+        self._webview_map_zoom = round(max(0, min(21, self.estimate_zoom_level())))
+
+    def _on_canvas_mouse_moved(self, map_point):
+        if self.window is None or not self.window.isVisible() or self._cursor_overlay is None:
+            return
+
+        if self._content_kind == "tile":
+            self._update_tile_cursor_overlay(map_point)
+        elif self._content_kind == "provider":
+            self._update_webview_cursor_overlay(map_point)
+
+    def _update_tile_cursor_overlay(self, map_point):
+        """Position the crosshair on the tile-basemap QgsMapCanvas. Unlike the
+        webview case, this canvas is a real QgsMapCanvas kept in sync with the
+        main QGIS canvas's extent (see _refresh_tile_canvas), so its own
+        map-to-pixel transform can be used directly -- exact, and with no
+        remembered center/zoom to drift out of sync."""
+        if self.map_canvas is None:
+            return
+
+        to_pixel = self.map_canvas.getCoordinateTransform()
+        pixel_point = to_pixel.transform(map_point)
+        x, y = pixel_point.x(), pixel_point.y()
+
+        if x < 0 or y < 0 or x > self.map_canvas.width() or y > self.map_canvas.height():
+            # Off the visible canvas area (can happen right at the edges, or
+            # briefly while the extent is still catching up after a pan/zoom).
+            self._cursor_overlay.hide()
+            return
+
+        size = self._cursor_overlay.width()
+        self._cursor_overlay.move(round(x - size / 2), round(y - size / 2))
+        self._cursor_overlay.show()
+        self._cursor_overlay.raise_()
+
+    def _update_webview_cursor_overlay(self, map_point):
+        """Position the crosshair on the webview, computed from web-mercator math
+        against whatever center/zoom the plugin last set on the page -- see
+        _CursorOverlay for why (we don't control the third-party page's own
+        rendering, so this is an estimate that can drift until the next refresh)."""
+        if (self.webview is None or self._webview_map_center is None
+                or self._webview_map_zoom is None):
+            return
+
+        latitude, longitude = self._map_point_to_wgs84(map_point)
+        center_lat, center_lon = self._webview_map_center
+        zoom = self._webview_map_zoom
+
+        cx, cy = sources.mercator_pixel(center_lat, center_lon, zoom)
+        px, py = sources.mercator_pixel(latitude, longitude, zoom)
+        dx, dy = px - cx, py - cy
+
+        half_w = self.webview.width() / 2
+        half_h = self.webview.height() / 2
+        if abs(dx) > half_w or abs(dy) > half_h:
+            # The QGIS cursor currently maps to a point off the visible webview
+            # area (or the two views have drifted out of sync) -- hide rather
+            # than draw a marker outside the widget's own bounds.
+            self._cursor_overlay.hide()
+            return
+
+        size = self._cursor_overlay.width()
+        self._cursor_overlay.move(round(half_w + dx - size / 2), round(half_h + dy - size / 2))
+        self._cursor_overlay.show()
+        self._cursor_overlay.raise_()
+
     def open_settings_dialog(self):
         dialog = QDialog(self.iface.mainWindow())
         dialog.setWindowTitle("QuickMapLink Settings")
@@ -528,14 +661,15 @@ class QuickMapLinkPlugin:
         enabled_checkbox.setChecked(self.context_menu_enabled)
         layout.addWidget(enabled_checkbox)
 
-        # Map Type Selection
-        map_type_label = QLabel("Select web map provider:")
+        # Map Type Selection -- web map providers (opened via webview/browser) and
+        # native tile basemaps (rendered directly, no webview) share one dropdown;
+        # a separator line visually splits the two groups.
+        map_type_label = QLabel("Select map provider:")
         layout.addWidget(map_type_label)
         map_type_combo = QComboBox()
-        map_type_combo.addItems([
-            "Google Maps", "Bing Maps", "Apple Maps",
-            "OpenStreetMap", "OpenTopoMap", "Wikimedia Maps",
-        ])
+        map_type_combo.addItems(sources.PROVIDERS)
+        map_type_combo.insertSeparator(len(sources.PROVIDERS))
+        map_type_combo.addItems(list(sources.TILE_BASEMAPS.keys()))
         map_type_combo.setCurrentText(self._normalized_map_type())
         layout.addWidget(map_type_combo)
 
@@ -575,11 +709,22 @@ class QuickMapLinkPlugin:
         enabled_checkbox.toggled.connect(apply_enabled_state)
 
         def refresh_provider_options(preferred_open_mode=None, preferred_basemap=None, preferred_overlay=None):
-            provider = _strip_experimental_marker(map_type_combo.currentText())
-            disabled = _webview_disabled(provider)
-            open_modes = ["Browser"] if disabled else ["Webview", "Browser"]
-            basemaps = PROVIDER_BASEMAPS.get(provider, BASEMAP_OPTIONS)
-            overlays = PROVIDER_OVERLAYS.get(provider, OVERLAY_OPTIONS)
+            provider = sources.strip_experimental_marker(map_type_combo.currentText())
+            is_tile = sources.is_tile_basemap(provider)
+
+            if is_tile:
+                # Tile basemaps are a native map layer, not a web page -- there's no
+                # browser-native way to view one interactively, so Webview (meaning
+                # the dock's native QgsMapCanvas here, not a literal web view) is the
+                # only option, and there's no separate overlay-layer concept at all.
+                open_modes = ["Webview"]
+                basemaps = sources.basemap_styles(provider)
+                overlays = ["None"]
+            else:
+                disabled = _webview_disabled(provider)
+                open_modes = ["Browser"] if disabled else ["Webview", "Browser"]
+                basemaps = sources.PROVIDER_BASEMAPS.get(provider, sources.BASEMAP_OPTIONS)
+                overlays = sources.PROVIDER_OVERLAYS.get(provider, sources.OVERLAY_OPTIONS)
 
             open_mode_combo.blockSignals(True)
             open_mode_combo.clear()
@@ -587,10 +732,20 @@ class QuickMapLinkPlugin:
             open_mode_combo.setCurrentText(preferred_open_mode if preferred_open_mode in open_modes else open_modes[0])
             open_mode_combo.blockSignals(False)
 
-            if provider in PROVIDERS_WITHOUT_WEBVIEW:
+            if is_tile:
+                open_mode_note.setText(
+                    f"* {provider} is a native map layer, not a web page -- it opens in the "
+                    f"dock directly (no separate Browser option).")
+                open_mode_note.setVisible(True)
+            elif not HAS_WEBVIEW:
+                open_mode_note.setText(
+                    "* Embedded webview isn't available on this QGIS build (no QtWebEngine "
+                    "or QtWebKit found) -- opens in your system browser instead.")
+                open_mode_note.setVisible(True)
+            elif provider in sources.PROVIDERS_WITHOUT_WEBVIEW:
                 open_mode_note.setText(f"* Webview isn't offered for {provider} (browser-only).")
                 open_mode_note.setVisible(True)
-            elif not USING_WEBENGINE and provider in PROVIDERS_BROKEN_ON_WEBKIT:
+            elif not USING_WEBENGINE and provider in sources.PROVIDERS_BROKEN_ON_WEBKIT:
                 open_mode_note.setText(
                     f"* Webview isn't offered for {provider}: this QGIS build has no QtWebEngine, "
                     f"and {provider}'s map doesn't render on the fallback renderer.")

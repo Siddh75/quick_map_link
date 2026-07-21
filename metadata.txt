@@ -2,7 +2,7 @@
 name=QuickMapLink
 qgisMinimumVersion=3.16
 description=Right-click the map canvas to instantly open that location in Google Maps, Bing Maps, Apple Maps, OpenStreetMap, OpenTopoMap, or Wikimedia Maps.
-version=2.1.0
+version=2.3.1
 author=Siddharth
 email=siddharthgupta7may@gmail.com
 category=Web
@@ -14,7 +14,16 @@ icon=icon.png
 tags=maps,google maps,bing maps,apple maps,openstreetmap,openstreetmap maps,web,context menu,webview,coordinates,location
 experimental=False
 deprecated=False
-changelog=2.1.0
+changelog=2.3.1
+        - Fixed the plugin failing to load at all on Qt6-based QGIS builds. Two independent fatal-on-import issues, both now fixed: the compiled resources.py resource file hardcoded a "from PyQt5 import QtCore" import (raised "PyQt5 classes cannot be imported in a QGIS build based on Qt6"); and the legacy QtWebKit fallback tried to import a module (QtWebKitWidgets) that doesn't exist under Qt6 at all, once the primary QtWebEngine import failed for any reason (raised "No module named 'PyQt6.QtWebKitWidgets'"). The plugin icon now loads directly from icon.png instead of through the compiled resource file, and if a QGIS build has no embedded-webview renderer at all (neither QtWebEngine nor QtWebKit), every web provider now degrades gracefully to opening in the system browser instead of crashing the plugin -- native tile basemaps are unaffected either way, since they never used a webview to begin with.
+    2.3.0
+        - Added native tile basemaps as a new kind of map source alongside the existing web providers: Esri World Hillshade, Esri World Topographic, USGS Topo, OpenStreetMap (tiles), CyclOSM, Google Maps (tiles), CartoDB, Esri Ocean, Esri NatGeo, Esri Light Gray, and Bing Maps (Aerial tiles). These render directly in QGIS's own map canvas (no embedded web page involved) inside the same dockable panel used for web providers.
+        - "Select map type" dropdown renamed to "Select map provider" and now lists web providers and tile basemaps together in one place.
+        - The mouse-cursor overlay (added in 2.2.0 for the webview) now also works on tile basemaps, and is positioned exactly via the map canvas's own coordinate transform rather than the estimate-based math the webview case still needs.
+        - Map provider and tile-basemap definitions moved into their own sources.py module, separate from the plugin's Qt/UI code.
+    2.2.0
+        - Added a live mouse-cursor overlay in the webview: as you move the mouse over the QGIS canvas, a small crosshair on the embedded map tracks where that position falls, computed from standard web-mercator math against the map's current center/zoom (accuracy depends on the embedded map still matching what QuickMapLink last set -- manually panning/zooming the embedded map yourself will cause it to drift until the next refresh).
+    2.1.0
         - Webview dock now remembers where it was left (docked side, or floating, and its exact size/position) and reopens the same way next time, including across QGIS restarts.
     2.0.0
         - Added OpenStreetMap, OpenTopoMap, and Wikimedia Maps as new providers.
